@@ -38,6 +38,7 @@ CODEC_EXTENSION_MAP = {
     "subrip": "srt",
     "srt": "srt",
     "sup": "sup",
+    "utf8": "srt",
     "textutf8": "srt",
     "truehd": "thd",
     "dts": "dts",
@@ -162,7 +163,8 @@ def normalize_language(value: str | None) -> str:
     if not value:
         return ""
     lowered = value.strip().lower()
-    return re.sub(r"[^a-z0-9]+", "", lowered)
+    normalized = lowered.replace("-", "_")
+    return re.sub(r"[^a-z0-9_]+", "", normalized)
 
 
 def expand_language_aliases(value: str) -> set[str]:
@@ -214,7 +216,8 @@ def subtitle_language_matches(target_languages: list[str], track_languages: list
 
 
 def sanitize_token(value: str, default: str = "na") -> str:
-    normalized = re.sub(r"[^A-Za-z0-9]+", "", value.strip().lower())
+    normalized = value.strip().lower().replace("-", "_")
+    normalized = re.sub(r"[^a-z0-9_]+", "", normalized)
     return normalized or default
 
 

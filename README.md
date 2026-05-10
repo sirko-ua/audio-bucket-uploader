@@ -31,7 +31,7 @@ Pass multiple target languages with repeated flags or comma-separated values, fo
 Pull the published image:
 
 ```bash
-docker pull ghcr.io/<github-owner>/audio-bucket-uploader:latest
+docker pull ghcr.io/sirko-ua/audio-bucket-uploader:latest
 ```
 
 Run it:
@@ -40,14 +40,13 @@ Run it:
 docker run --rm \
   -v /path/to/movies:/input:ro \
   -v /path/to/output:/output \
-  ghcr.io/<github-owner>/audio-bucket-uploader:latest \
-  --api-key your_api_key \
-  --api-url http://host.docker.internal:8000/api/uploader \
+  ghcr.io/sirko-ua/audio-bucket-uploader:latest \
+  --api-key <your_api_key> \
+  --api-url https://audio-bucket.site/api/uploader \
   --input /input \
   --audio-language uk \
   --subtitle-language all \
   --output-dir /output \
-  --keep-extracted \
   --verbose
 ```
 
@@ -61,8 +60,8 @@ python -m pip install -r requirements.txt
 
 ```bash
 python -m uploader \
-  --api-key your_api_key \
-  --api-url http://127.0.0.1:8000/api/uploader \
+  --api-key <your_api_key> \
+  --api-url https://audio-bucket.site/api/uploader  \
   --input /media/movies \
   --verbose
 ```
@@ -73,8 +72,8 @@ If you want to keep extracted files, pass `--keep-extracted`. If you want them w
 
 ```bash
 python -m uploader \
-  --api-key your_api_key \
-  --api-url http://127.0.0.1:8000/api/uploader \
+  --api-key <your_api_key> \
+  --api-url https://audio-bucket.site/api/uploader \
   --input /media/movies \
   --audio-language uk \
   --subtitle-language all \

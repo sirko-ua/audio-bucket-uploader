@@ -29,6 +29,7 @@ CODEC_EXTENSION_MAP = {
     "ac3": "ac3",
     "alac": "m4a",
     "ass": "ass",
+    "e_ac_3": "eac3",
     "eac3": "eac3",
     "flac": "flac",
     "opus": "opus",
@@ -255,7 +256,7 @@ def get_media_info_value(track: dict | None, *keys: str) -> object | None:
 
 def canonicalize_codec(value: object) -> str:
     normalized = sanitize_token(str(value))
-    if normalized.startswith("subrip") or normalized in {"srt", "stextutf8", "textutf8"}:
+    if normalized.startswith("subrip") or normalized in {"srt", "stextutf8", "stext_utf8", "textutf8", "text_utf8", "utf8", "utf_8"}:
         return "subrip"
     return normalized
 

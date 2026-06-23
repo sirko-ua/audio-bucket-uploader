@@ -51,6 +51,10 @@ TRACK_TYPE_EXTENSION_DEFAULTS = {
 }
 
 ALL_SUBTITLE_LANGUAGES = "__all_subtitle_languages__"
+DEFAULT_AUDIO_LANGUAGES = ["uk"]
+DEFAULT_SUBTITLE_LANGUAGES = ["all"]
+DEFAULT_INPUT = "/input"
+DEFAULT_VERBOSE = True
 
 
 class UploaderError(RuntimeError):
@@ -118,7 +122,11 @@ def parse_args() -> argparse.Namespace:
         required=True,
         help="Audio Bucket uploader endpoint URL.",
     )
-    parser.add_argument("--input", required=True, help="Path to a .mkv file or a directory containing .mkv files.")
+    parser.add_argument(
+        "--input",
+        default=DEFAULT_INPUT,
+        help="Path to a .mkv file or a directory containing .mkv files. Defaults to /input.",
+    )
     parser.add_argument(
         "--audio-language",
         action="append",
@@ -129,11 +137,12 @@ def parse_args() -> argparse.Namespace:
         "--subtitle-language",
         action="append",
         dest="subtitle_languages",
-        help="Target subtitle track language. Can be passed multiple times or as a comma-separated list. Defaults to uk,en.",
+        help="Target subtitle track language. Can be passed multiple times or as a comma-separated list. Defaults to all.",
     )
     parser.add_argument(
         "--output-dir",
-        help="Directory where extracted tracks will be written. Defaults to the system temp directory.",
+        default=str(get_default_output_dir()),
+        help=f"Directory where extracted tracks will be written. Defaults to the system temp directory ({get_default_output_dir()}).",
     )
     parser.add_argument(
         "--keep-extracted",
@@ -142,8 +151,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--verbose",
-        action="store_true",
-        help="Print detailed extraction planning output.",
+        action=argparse.BooleanOptionalAction,
+        default=DEFAULT_VERBOSE,
+        help="Print detailed extraction planning output. Defaults to true; use --no-verbose to disable.",
     )
     return parser.parse_args()
 
@@ -194,7 +204,7 @@ def parse_language_filters(values: list[str] | None, default_values: list[str]) 
 
 
 def parse_subtitle_language_filters(values: list[str] | None) -> list[str]:
-    normalized_values = parse_language_filters(values, ["all"])
+    normalized_values = parse_language_filters(values, DEFAULT_SUBTITLE_LANGUAGES)
     if "all" in normalized_values:
         return [ALL_SUBTITLE_LANGUAGES]
     return normalized_values
@@ -533,11 +543,9 @@ def main() -> int:
     input_path = Path(args.input).expanduser().resolve()
     output_dir = (
         Path(args.output_dir).expanduser().resolve()
-        if args.output_dir
-        else get_default_output_dir()
     )
     target_languages_by_type = {
-        "audio": parse_language_filters(args.audio_languages, ["uk"]),
+        "audio": parse_language_filters(args.audio_languages, DEFAULT_AUDIO_LANGUAGES),
         "subtitles": parse_subtitle_language_filters(args.subtitle_languages),
     }
 

@@ -520,9 +520,30 @@ def upload_prepared_track(api_url: str, api_key: str, prepared_track: PreparedTr
         raise UploaderError(f"Upload response was not valid JSON for {prepared_track.output_path.name}") from exc
 
 
+def format_table(headers: list[str], rows: list[list[object]]) -> str:
+    string_rows = [[str(value) for value in row] for row in rows]
+    widths = [
+        max(len(header), *(len(row[index]) for row in string_rows)) if string_rows else len(header)
+        for index, header in enumerate(headers)
+    ]
+    separator = "+-" + "-+-".join("-" * width for width in widths) + "-+"
+    header_line = "| " + " | ".join(header.ljust(widths[index]) for index, header in enumerate(headers)) + " |"
+    body_lines = [
+        "| " + " | ".join(value.ljust(widths[index]) for index, value in enumerate(row)) + " |"
+        for row in string_rows
+    ]
+    return "\n".join([separator, header_line, separator, *body_lines, separator])
+
+
 def log(message: str, *, verbose: bool) -> None:
     if verbose:
         print(message)
+
+
+def log_table(title: str, headers: list[str], rows: list[list[object]], *, verbose: bool) -> None:
+    if verbose and rows:
+        print(title)
+        print(format_table(headers, rows))
 
 
 def get_default_output_dir() -> Path:
@@ -555,6 +576,12 @@ def main() -> int:
 
     log(f"Uploading extracted tracks to {args.api_url}", verbose=args.verbose)
     print(f"Found {len(mkv_files)} MKV file(s).")
+    log_table(
+        "Detected MKV files:",
+        ["#", "file", "path"],
+        [[index, file_path.name, file_path] for index, file_path in enumerate(mkv_files, start=1)],
+        verbose=args.verbose,
+    )
 
     extracted_count = 0
     uploaded_count = 0
@@ -572,15 +599,36 @@ def main() -> int:
                 f"or subtitle tracks for {subtitle_filter_label} found."
             )
             continue
-        for prepared_track in prepared_tracks:
-            log(
-                f"Prepared filename for track {prepared_track.track_id}: {prepared_track.output_path.name}",
-                verbose=args.verbose,
-            )
+        log_table(
+            f"Extraction plan for {file_path.name}:",
+            ["track", "type", "lang", "codec", "channels", "bitrate", "fps", "output"],
+            [
+                [
+                    prepared_track.track_id,
+                    prepared_track.track_type,
+                    prepared_track.language,
+                    prepared_track.codec,
+                    prepared_track.channels,
+                    prepared_track.bitrate,
+                    prepared_track.fps,
+                    prepared_track.output_path.name,
+                ]
+                for prepared_track in prepared_tracks
+            ],
+            verbose=args.verbose,
+        )
         extract_tracks(file_path, prepared_tracks)
         extracted_count += len(prepared_tracks)
+        log_table(
+            f"Extracted tracks for {file_path.name}:",
+            ["track", "type", "path"],
+            [
+                [prepared_track.track_id, prepared_track.track_type, prepared_track.output_path]
+                for prepared_track in prepared_tracks
+            ],
+            verbose=args.verbose,
+        )
         for prepared_track in prepared_tracks:
-            print(f"Extracted {prepared_track.track_type} track {prepared_track.track_id} -> {prepared_track.output_path}")
             upload_response = upload_prepared_track(args.api_url, args.api_key, prepared_track)
             uploaded_count += 1
             print(f"Uploaded {prepared_track.output_path.name} as draft track {upload_response.get('id')}")

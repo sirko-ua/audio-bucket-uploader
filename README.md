@@ -15,6 +15,7 @@ Extracts audio and subtitle tracks from `.mkv` files by language and uploads the
 - uploads each extracted track to Audio Bucket as a draft through `POST /api/uploader`
 - sends `track_type`, `language`, `fps`, and `media_file` in the upload request
 - shows per-file upload progress while each extracted track is being sent
+- prints verbose detection and extraction details as tables
 - removes each extracted file after a successful upload unless `--keep-extracted` is set
 
 For subtitle tracks without channel or bitrate metadata, `na` is used in those slots.
@@ -31,7 +32,7 @@ If the source video FPS cannot be detected, the track is not uploaded because th
 | `--subtitle-language` | No | `all` | Target subtitle track language. Pass it multiple times or use comma-separated values. `all` uploads every subtitle track regardless of language. |
 | `--output-dir` | No | OS-specific temp directory | Directory where extracted tracks are written before upload. On macOS and Linux this is typically `/tmp`; on Windows it follows the standard temp location from the OS environment. |
 | `--keep-extracted` | No | `false` | Keep extracted files after successful upload. By default, uploaded extracted files are deleted. |
-| `--verbose`, `--no-verbose` | No | `true` | Print detailed extraction planning and cleanup output. Use `--no-verbose` to disable it. |
+| `--verbose`, `--no-verbose` | No | `true` | Print detailed file detection, extraction planning, extraction results, and cleanup output. Detection and extraction details are shown as tables. Use `--no-verbose` to disable it. |
 
 Language filters are normalized, and common aliases are supported for languages such as `uk`, `ukr`, and `ukrainian`.
 

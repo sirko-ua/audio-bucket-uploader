@@ -70,6 +70,7 @@ class PreparedTrack:
     channels: str
     bitrate: str
     fps: str
+    original_title_from_container: str
     output_path: Path
 
 
@@ -357,6 +358,16 @@ def find_media_info_track(media_info_by_type: dict[str, list[dict]], track_type:
     return tracks[index]
 
 
+def get_original_title_from_container(track: dict, media_info_track: dict | None) -> str:
+    properties = track.get("properties", {})
+    title = (
+        properties.get("title")
+        or properties.get("track_name")
+        or get_media_info_value(media_info_track, "title", "Title")
+    )
+    return str(title).strip() if title else ""
+
+
 def collect_media_info(file_path: Path) -> tuple[dict[str, list[dict]], dict]:
     media_info_payload = run_json_command(["mediainfo", "--Output=JSON", str(file_path)])
     mkvmerge_payload = run_json_command(["mkvmerge", "-J", str(file_path)])
@@ -415,6 +426,7 @@ def build_prepared_tracks(
         fallback_language = "und" if target_languages == [ALL_SUBTITLE_LANGUAGES] else target_languages[0]
         language = normalize_language(properties.get("language_ietf") or properties.get("language") or fallback_language)
         codec = infer_codec(track, media_info_track)
+        original_title_from_container = get_original_title_from_container(track, media_info_track)
         channels = format_channels(get_media_info_value(media_info_track, "channel_s", "Channel(s)"))
         bitrate = format_bitrate(
             get_media_info_value(media_info_track, "bit_rate", "BitRate")
@@ -447,6 +459,7 @@ def build_prepared_tracks(
                 channels=channels,
                 bitrate=bitrate,
                 fps=fps,
+                original_title_from_container=original_title_from_container,
                 output_path=output_path,
             )
         )
@@ -495,7 +508,8 @@ def upload_prepared_track(api_url: str, api_key: str, prepared_track: PreparedTr
                 data={
                     "track_type": prepared_track.track_type,
                     "language": prepared_track.language,
-                    "fps": prepared_track.fps,
+                    "original_video_fps": prepared_track.fps,
+                    "original_title_from_container": prepared_track.original_title_from_container,
                 },
                 files={"media_file": (prepared_track.output_path.name, progress_file)},
                 timeout=60.0 * 10,
@@ -601,7 +615,7 @@ def main() -> int:
             continue
         log_table(
             f"Extraction plan for {file_path.name}:",
-            ["track", "type", "lang", "codec", "channels", "bitrate", "fps", "output"],
+            ["track", "type", "lang", "codec", "channels", "bitrate", "fps", "title", "output"],
             [
                 [
                     prepared_track.track_id,
@@ -611,6 +625,7 @@ def main() -> int:
                     prepared_track.channels,
                     prepared_track.bitrate,
                     prepared_track.fps,
+                    prepared_track.original_title_from_container,
                     prepared_track.output_path.name,
                 ]
                 for prepared_track in prepared_tracks

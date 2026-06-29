@@ -13,7 +13,7 @@ Extracts audio and subtitle tracks from `.mkv` files by language and uploads the
 ```
 
 - uploads each extracted track to Audio Bucket as a draft through `POST /api/uploader`
-- sends `track_type`, `language`, `fps`, and `media_file` in the upload request
+- sends `track_type`, `language`, `original_video_fps`, `original_title_from_container`, and `media_file` in the upload request
 - shows per-file upload progress while each extracted track is being sent
 - prints verbose detection and extraction details as tables
 - removes each extracted file after a successful upload unless `--keep-extracted` is set

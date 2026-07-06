@@ -63,14 +63,12 @@ class UploaderError(RuntimeError):
 
 @dataclass
 class PreparedTrack:
-    track_id: int
+    extraction_track_id: int
+    media_info_track_id: str
     track_type: str
     language: str
-    codec: str
-    channels: str
-    bitrate: str
-    fps: str
-    original_title_from_container: str
+    original_video_mediainfo: dict
+    original_video_mediainfo_text: str
     output_path: Path
 
 
@@ -154,7 +152,7 @@ def parse_args() -> argparse.Namespace:
         "--verbose",
         action=argparse.BooleanOptionalAction,
         default=DEFAULT_VERBOSE,
-        help="Print detailed extraction planning output. Defaults to true; use --no-verbose to disable.",
+        help="Print detailed detection, extraction, and cleanup output. Defaults to true; use --no-verbose to disable.",
     )
     return parser.parse_args()
 
@@ -165,6 +163,11 @@ def run_json_command(command: list[str]) -> dict:
         return json.loads(completed.stdout)
     except json.JSONDecodeError as exc:
         raise UploaderError(f"Command did not return valid JSON: {' '.join(command)}") from exc
+
+
+def run_text_command(command: list[str]) -> str:
+    completed = subprocess.run(command, capture_output=True, text=True, check=True)
+    return completed.stdout
 
 
 def run_command(command: list[str]) -> None:
@@ -272,58 +275,6 @@ def canonicalize_codec(value: object) -> str:
     return normalized
 
 
-def title_has_marker(value: object, marker: str) -> bool:
-    if not value:
-        return False
-    return marker.lower() in str(value).lower()
-
-
-def subtitle_disposition_tokens(track: dict) -> list[str]:
-    properties = track.get("properties", {})
-    title = properties.get("track_name") or properties.get("title") or ""
-    tokens: list[str] = []
-
-    if properties.get("forced_track") or properties.get("flag_forced") or title_has_marker(title, "forced"):
-        tokens.append("forced")
-    if title_has_marker(title, "sdh"):
-        tokens.append("sdh")
-    return tokens
-
-
-def format_bitrate(value: object) -> str:
-    if value in (None, ""):
-        return "na"
-    match = re.search(r"\d+", str(value))
-    if not match:
-        return "na"
-    bitrate = int(match.group(0))
-    if bitrate >= 1000:
-        return f"{round(bitrate / 1000)}kbps"
-    return f"{bitrate}bps"
-
-
-def format_channels(value: object) -> str:
-    if value in (None, ""):
-        return "na"
-    match = re.search(r"\d+(\.\d+)?", str(value))
-    if not match:
-        return "na"
-    number = float(match.group(0))
-    if number.is_integer():
-        return f"{int(number)}ch"
-    return f"{number:g}ch"
-
-
-def format_fps(value: object) -> str:
-    if value in (None, ""):
-        return "na"
-    match = re.search(r"\d+(\.\d+)?", str(value))
-    if not match:
-        return "na"
-    number = float(match.group(0))
-    return f"{number:.3f}".rstrip("0").rstrip(".")
-
-
 def normalize_movie_name(file_path: Path) -> str:
     raw_name = file_path.stem.strip().strip("\"'")
     normalized = re.sub(r"[\\/:*?\"<>|]+", " ", raw_name)
@@ -351,25 +302,46 @@ def infer_codec(track: dict, media_info_track: dict | None) -> str:
     return "unknown"
 
 
-def find_media_info_track(media_info_by_type: dict[str, list[dict]], track_type: str, index: int) -> dict | None:
+def find_media_info_track(
+    media_info_by_type: dict[str, list[dict]],
+    mkvmerge_track: dict,
+    track_type: str,
+    index: int,
+) -> dict | None:
     tracks = media_info_by_type.get(track_type, [])
+    properties = mkvmerge_track.get("properties", {})
+    uid = properties.get("uid")
+    if uid is not None:
+        for track in tracks:
+            if str(get_media_info_value(track, "unique_id", "UniqueID")) == str(uid):
+                return track
+
+    track_number = properties.get("number")
+    if track_number is not None:
+        for track in tracks:
+            if str(get_media_info_value(track, "id", "ID")) == str(track_number):
+                return track
+
     if index >= len(tracks):
         return None
     return tracks[index]
 
 
-def get_original_title_from_container(track: dict, media_info_track: dict | None) -> str:
-    properties = track.get("properties", {})
-    title = (
-        properties.get("title")
-        or properties.get("track_name")
-        or get_media_info_value(media_info_track, "title", "Title")
-    )
-    return str(title).strip() if title else ""
+def get_media_info_track_id(media_info_track: dict | None, mkvmerge_track: dict) -> str:
+    media_info_id = get_media_info_value(media_info_track, "id", "ID")
+    if media_info_id is not None:
+        return str(media_info_id)
+
+    track_number = mkvmerge_track.get("properties", {}).get("number")
+    if track_number is not None:
+        return str(track_number)
+
+    raise UploaderError(f"Cannot find MediaInfo ID for container track {mkvmerge_track.get('id')}")
 
 
-def collect_media_info(file_path: Path) -> tuple[dict[str, list[dict]], dict]:
+def collect_media_info(file_path: Path) -> tuple[dict[str, list[dict]], dict, str, dict]:
     media_info_payload = run_json_command(["mediainfo", "--Output=JSON", str(file_path)])
+    media_info_text = run_text_command(["mediainfo", str(file_path)])
     mkvmerge_payload = run_json_command(["mkvmerge", "-J", str(file_path)])
 
     tracks_by_type: dict[str, list[dict]] = {"video": [], "audio": [], "text": []}
@@ -378,7 +350,7 @@ def collect_media_info(file_path: Path) -> tuple[dict[str, list[dict]], dict]:
         if track_type in tracks_by_type:
             tracks_by_type[track_type].append(track)
 
-    return tracks_by_type, mkvmerge_payload
+    return tracks_by_type, media_info_payload, media_info_text, mkvmerge_payload
 
 
 def build_prepared_tracks(
@@ -386,14 +358,11 @@ def build_prepared_tracks(
     output_dir: Path,
     target_languages_by_type: dict[str, list[str]],
 ) -> list[PreparedTrack]:
-    media_info_by_type, mkvmerge_payload = collect_media_info(file_path)
+    media_info_by_type, media_info_payload, media_info_text, mkvmerge_payload = collect_media_info(file_path)
     movie_name = normalize_movie_name(file_path)
-    video_track = media_info_by_type.get("video", [{}])[0]
-    fps = format_fps(get_media_info_value(video_track, "frame_rate", "FrameRate"))
 
     type_indices = {"audio": 0, "subtitles": 0}
     prepared_tracks: list[PreparedTrack] = []
-    used_output_paths: set[Path] = set()
 
     for track in mkvmerge_payload.get("tracks", []):
         track_type = track.get("type")
@@ -418,6 +387,7 @@ def build_prepared_tracks(
 
         media_info_track = find_media_info_track(
             media_info_by_type,
+            track,
             "audio" if track_type == "audio" else "text",
             type_indices[track_type],
         )
@@ -426,40 +396,17 @@ def build_prepared_tracks(
         fallback_language = "und" if target_languages == [ALL_SUBTITLE_LANGUAGES] else target_languages[0]
         language = normalize_language(properties.get("language_ietf") or properties.get("language") or fallback_language)
         codec = infer_codec(track, media_info_track)
-        original_title_from_container = get_original_title_from_container(track, media_info_track)
-        channels = format_channels(get_media_info_value(media_info_track, "channel_s", "Channel(s)"))
-        bitrate = format_bitrate(
-            get_media_info_value(media_info_track, "bit_rate", "BitRate")
-            if media_info_track
-            else properties.get("audio_bits_per_sample")
-        )
         extension = detect_extension(codec, track_type)
-        if track_type == "subtitles":
-            subtitle_tokens = [
-                language or sanitize_token(fallback_language),
-                codec,
-                *subtitle_disposition_tokens(track),
-                fps,
-            ]
-            channels = "na"
-            bitrate = "na"
-            base_name = f"{movie_name}_[{'_'.join(subtitle_tokens)}]"
-        else:
-            base_name = f"{movie_name}_[{language or sanitize_token(fallback_language)}_{codec}_{channels}_{bitrate}_{fps}]"
-        output_path = output_dir / f"{base_name}.{extension}"
-        if output_path in used_output_paths:
-            output_path = output_dir / f"{base_name}_track{track['id']}.{extension}"
-        used_output_paths.add(output_path)
+        media_info_track_id = get_media_info_track_id(media_info_track, track)
+        output_path = output_dir / f"{movie_name}_track{media_info_track_id}.{extension}"
         prepared_tracks.append(
             PreparedTrack(
-                track_id=int(track["id"]),
+                extraction_track_id=int(track["id"]),
+                media_info_track_id=media_info_track_id,
                 track_type=track_type,
                 language=language or sanitize_token(fallback_language),
-                codec=codec,
-                channels=channels,
-                bitrate=bitrate,
-                fps=fps,
-                original_title_from_container=original_title_from_container,
+                original_video_mediainfo=media_info_payload,
+                original_video_mediainfo_text=media_info_text,
                 output_path=output_path,
             )
         )
@@ -487,13 +434,11 @@ def extract_tracks(file_path: Path, prepared_tracks: list[PreparedTrack]) -> Non
     command = ["mkvextract", "tracks", str(file_path)]
     for prepared_track in prepared_tracks:
         prepared_track.output_path.parent.mkdir(parents=True, exist_ok=True)
-        command.append(f"{prepared_track.track_id}:{prepared_track.output_path}")
+        command.append(f"{prepared_track.extraction_track_id}:{prepared_track.output_path}")
     run_command(command)
 
 
 def upload_prepared_track(api_url: str, api_key: str, prepared_track: PreparedTrack) -> dict:
-    if prepared_track.fps == "na":
-        raise UploaderError(f"Cannot upload {prepared_track.output_path.name}: original video FPS is unknown.")
     if not prepared_track.output_path.is_file():
         raise UploaderError(f"Cannot upload missing extracted file: {prepared_track.output_path}")
 
@@ -506,10 +451,9 @@ def upload_prepared_track(api_url: str, api_key: str, prepared_track: PreparedTr
                 api_url,
                 headers={"Authorization": f"Bearer {api_key}"},
                 data={
-                    "track_type": prepared_track.track_type,
-                    "language": prepared_track.language,
-                    "original_video_fps": prepared_track.fps,
-                    "original_title_from_container": prepared_track.original_title_from_container,
+                    "original_video_mediainfo": json.dumps(prepared_track.original_video_mediainfo),
+                    "original_video_mediainfo_text": prepared_track.original_video_mediainfo_text,
+                    "track_id_inside_container": prepared_track.media_info_track_id,
                 },
                 files={"media_file": (prepared_track.output_path.name, progress_file)},
                 timeout=60.0 * 10,
@@ -613,32 +557,19 @@ def main() -> int:
                 f"or subtitle tracks for {subtitle_filter_label} found."
             )
             continue
-        log_table(
-            f"Extraction plan for {file_path.name}:",
-            ["track", "type", "lang", "codec", "channels", "bitrate", "fps", "title", "output"],
-            [
-                [
-                    prepared_track.track_id,
-                    prepared_track.track_type,
-                    prepared_track.language,
-                    prepared_track.codec,
-                    prepared_track.channels,
-                    prepared_track.bitrate,
-                    prepared_track.fps,
-                    prepared_track.original_title_from_container,
-                    prepared_track.output_path.name,
-                ]
-                for prepared_track in prepared_tracks
-            ],
-            verbose=args.verbose,
-        )
+        print(f"Extracting {len(prepared_tracks)} track(s) from {file_path.name}...")
         extract_tracks(file_path, prepared_tracks)
         extracted_count += len(prepared_tracks)
         log_table(
             f"Extracted tracks for {file_path.name}:",
-            ["track", "type", "path"],
+            ["mediainfo_id", "type", "language", "path"],
             [
-                [prepared_track.track_id, prepared_track.track_type, prepared_track.output_path]
+                [
+                    prepared_track.media_info_track_id,
+                    prepared_track.track_type,
+                    prepared_track.language,
+                    prepared_track.output_path,
+                ]
                 for prepared_track in prepared_tracks
             ],
             verbose=args.verbose,

@@ -9,17 +9,14 @@ Extracts audio and subtitle tracks from `.mkv` files by language and uploads the
 - names extracted files as:
 
 ```text
-{original_movie_name}_[{track_language}_{codec}_{channels}_{bitrate}_{FPS_of_video}].{extension}
+{original_movie_name}_track{track_id_inside_container}.{detected_extension}
 ```
 
 - uploads each extracted track to Audio Bucket as a draft through `POST /api/uploader`
-- sends `track_type`, `language`, `original_video_fps`, `original_title_from_container`, and `media_file` in the upload request
-- shows per-file upload progress while each extracted track is being sent
-- prints verbose detection and extraction details as tables
+- sends the extracted `media_file`, original MKV MediaInfo JSON/text, and MediaInfo `ID` as `track_id_inside_container` in the upload request
+- shows per-file extraction progress and per-file upload progress while each extracted track is being sent
+- prints verbose detection and extraction results as tables
 - removes each extracted file after a successful upload unless `--keep-extracted` is set
-
-For subtitle tracks without channel or bitrate metadata, `na` is used in those slots.
-If the source video FPS cannot be detected, the track is not uploaded because the API requires `original_video_fps`.
 
 ## Arguments
 
@@ -32,7 +29,7 @@ If the source video FPS cannot be detected, the track is not uploaded because th
 | `--subtitle-language` | No | `all` | Target subtitle track language. Pass it multiple times or use comma-separated values. `all` uploads every subtitle track regardless of language. |
 | `--output-dir` | No | OS-specific temp directory | Directory where extracted tracks are written before upload. On macOS and Linux this is typically `/tmp`; on Windows it follows the standard temp location from the OS environment. |
 | `--keep-extracted` | No | `false` | Keep extracted files after successful upload. By default, uploaded extracted files are deleted. |
-| `--verbose`, `--no-verbose` | No | `true` | Print detailed file detection, extraction planning, extraction results, and cleanup output. Detection and extraction details are shown as tables. Use `--no-verbose` to disable it. |
+| `--verbose`, `--no-verbose` | No | `true` | Print detailed file detection, extraction results, and cleanup output. Detection and extraction details are shown as tables. Use `--no-verbose` to disable it. |
 
 Language filters are normalized, and common aliases are supported for languages such as `uk`, `ukr`, and `ukrainian`.
 

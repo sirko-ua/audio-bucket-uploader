@@ -454,18 +454,27 @@ def get_file_hash(file_path: Path) -> str:
     return digest.hexdigest()
 
 
-def is_track_already_published(api_url: str, api_key: str, file_path: Path) -> bool:
+def is_track_already_published(api_url: str, api_key: str, file_path: Path, *, verbose: bool) -> bool:
     file_hash = get_file_hash(file_path)
     check_url = f"{api_url.rstrip('/')}/hash-check"
+    request_payload = {
+        "file_hash": file_hash,
+        "file_hash_algorithm": "blake3-256",
+    }
+    log(
+        f"Hash check request to {check_url}:\n{json.dumps(request_payload, indent=2)}",
+        verbose=verbose,
+    )
     try:
         response = httpx.post(
             check_url,
             headers={"Authorization": f"Bearer {api_key}"},
-            json={
-                "file_hash": file_hash,
-                "file_hash_algorithm": "blake3-256",
-            },
+            json=request_payload,
             timeout=60.0,
+        )
+        log(
+            f"Hash check response ({response.status_code}):\n{response.text}",
+            verbose=verbose,
         )
         response.raise_for_status()
     except httpx.HTTPStatusError as exc:
@@ -630,7 +639,12 @@ def main() -> int:
             verbose=args.verbose,
         )
         for prepared_track in prepared_tracks:
-            if is_track_already_published(args.api_url, args.api_key, prepared_track.output_path):
+            if is_track_already_published(
+                args.api_url,
+                args.api_key,
+                prepared_track.output_path,
+                verbose=args.verbose,
+            ):
                 skipped_count += 1
                 print(f"Track {prepared_track.output_path.name} already published; skipping upload.")
                 continue

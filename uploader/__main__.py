@@ -55,6 +55,7 @@ DEFAULT_AUDIO_LANGUAGES = ["uk"]
 DEFAULT_SUBTITLE_LANGUAGES = ["all"]
 DEFAULT_INPUT = "/input"
 DEFAULT_VERBOSE = True
+DEFAULT_VISIBILITY = "draft"
 
 
 class UploaderError(RuntimeError):
@@ -147,6 +148,12 @@ def parse_args() -> argparse.Namespace:
         "--keep-extracted",
         action="store_true",
         help="Keep extracted files after successful upload instead of deleting them.",
+    )
+    parser.add_argument(
+        "--visibility",
+        choices=("draft", "public"),
+        default=DEFAULT_VISIBILITY,
+        help="Visibility for uploaded tracks. Defaults to draft.",
     )
     parser.add_argument(
         "--verbose",
@@ -438,7 +445,12 @@ def extract_tracks(file_path: Path, prepared_tracks: list[PreparedTrack]) -> Non
     run_command(command)
 
 
-def upload_prepared_track(api_url: str, api_key: str, prepared_track: PreparedTrack) -> dict:
+def upload_prepared_track(
+    api_url: str,
+    api_key: str,
+    prepared_track: PreparedTrack,
+    visibility: str,
+) -> dict:
     if not prepared_track.output_path.is_file():
         raise UploaderError(f"Cannot upload missing extracted file: {prepared_track.output_path}")
 
@@ -454,6 +466,7 @@ def upload_prepared_track(api_url: str, api_key: str, prepared_track: PreparedTr
                     "original_video_mediainfo": json.dumps(prepared_track.original_video_mediainfo),
                     "original_video_mediainfo_text": prepared_track.original_video_mediainfo_text,
                     "track_id_inside_container": prepared_track.media_info_track_id,
+                    "visibility": visibility,
                 },
                 files={"media_file": (prepared_track.output_path.name, progress_file)},
                 timeout=60.0 * 10,
@@ -575,14 +588,19 @@ def main() -> int:
             verbose=args.verbose,
         )
         for prepared_track in prepared_tracks:
-            upload_response = upload_prepared_track(args.api_url, args.api_key, prepared_track)
+            upload_response = upload_prepared_track(
+                args.api_url,
+                args.api_key,
+                prepared_track,
+                args.visibility,
+            )
             uploaded_count += 1
-            print(f"Uploaded {prepared_track.output_path.name} as draft track {upload_response.get('id')}")
+            print(f"Uploaded {prepared_track.output_path.name} as {args.visibility} track {upload_response.get('id')}")
             if not args.keep_extracted:
                 remove_extracted_file(prepared_track)
                 log(f"Removed extracted file {prepared_track.output_path}", verbose=args.verbose)
 
-    print(f"Prepared {extracted_count} extracted track file(s). Uploaded {uploaded_count} draft track(s).")
+    print(f"Prepared {extracted_count} extracted track file(s). Uploaded {uploaded_count} {args.visibility} track(s).")
     return 0
 
 

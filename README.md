@@ -1,100 +1,100 @@
 # Audio Bucket Uploader
 
-Extracts audio and subtitle tracks from `.mkv` files by language and uploads them to Audio Bucket.
+Витягує аудіодоріжки й доріжки субтитрів із файлів `.mkv` за мовою та завантажує їх до Audio Bucket.
 
-## Overview
+## Огляд
 
-- finds one `.mkv` file or recursively scans a directory for `.mkv` files
-- extracts matching audio and subtitle tracks with `mkvextract`
-- names extracted files as:
+- знаходить один файл `.mkv` або рекурсивно сканує каталог на наявність файлів `.mkv`
+- витягує відповідні аудіодоріжки й доріжки субтитрів за допомогою `mkvextract`
+- називає витягнуті файли за шаблоном:
 
 ```text
 {original_movie_name}_track{track_id_inside_container}.{detected_extension}
 ```
 
-- uploads each extracted track to Audio Bucket as a draft or public track through `POST /api/uploader`
-- sends the extracted `media_file`, original MKV MediaInfo JSON/text, MediaInfo `ID` as `track_id_inside_container`, and the selected `visibility` in the upload request
-- shows per-file extraction progress and per-file upload progress while each extracted track is being sent
-- prints verbose detection and extraction results as tables
-- removes each extracted file after a successful upload unless `--keep-extracted` is set
+- завантажує кожну витягнуту доріжку до Audio Bucket як чернетку або публічну доріжку через `POST /api/uploader`
+- передає у запиті на завантаження витягнутий `media_file`, оригінальні JSON/текст MediaInfo для MKV, `ID` MediaInfo як `track_id_inside_container` та вибране значення `visibility`
+- показує поступ витягання та завантаження для кожного файлу під час надсилання кожної витягнутої доріжки
+- виводить докладні результати виявлення й витягання у вигляді таблиць
+- видаляє кожен витягнутий файл після успішного завантаження, якщо не вказано `--keep-extracted`
 
-## Arguments
+## Аргументи
 
-| Argument | Required | Default | Description |
+| Аргумент | Обов’язковий | Типове значення | Опис |
 | --- | --- | --- | --- |
-| `--api-key` | Yes | none | Audio Bucket user API key. It is sent as a bearer token in the upload request. |
-| `--api-url` | Yes | none | Audio Bucket uploader endpoint URL, for example `https://audio-bucket.site/api/uploader`. |
-| `--input` | No | `/input` | Path to a single `.mkv` file or a directory containing `.mkv` files. Directories are scanned recursively. |
-| `--audio-language` | No | `uk` | Target audio track language. Pass it multiple times or use comma-separated values, for example `--audio-language uk --audio-language en` or `--audio-language uk,en`. |
-| `--subtitle-language` | No | `all` | Target subtitle track language. Pass it multiple times or use comma-separated values. `all` uploads every subtitle track regardless of language. |
-| `--output-dir` | No | OS-specific temp directory | Directory where extracted tracks are written before upload. On macOS and Linux this is typically `/tmp`; on Windows it follows the standard temp location from the OS environment. |
-| `--keep-extracted` | No | `false` | Keep extracted files after successful upload. By default, uploaded extracted files are deleted. |
-| `--visibility` | No | `draft` | Visibility for uploaded tracks: `draft` or `public`. |
-| `--verbose`, `--no-verbose` | No | `true` | Print detailed file detection, extraction results, and cleanup output. Detection and extraction details are shown as tables. Use `--no-verbose` to disable it. |
+| `--api-key` | Так | немає | API-ключ користувача Audio Bucket. Він надсилається як bearer-токен у запиті на завантаження. |
+| `--api-url` | Так | немає | URL кінцевої точки завантажувача Audio Bucket, наприклад `https://audio-bucket.site/api/uploader`. |
+| `--input` | Ні | `/input` | Шлях до одного файлу `.mkv` або каталогу з файлами `.mkv`. Каталоги скануються рекурсивно. |
+| `--audio-language` | Ні | `uk` | Мова цільової аудіодоріжки. Передавайте параметр кілька разів або використовуйте значення, розділені комами, наприклад `--audio-language uk --audio-language en` чи `--audio-language uk,en`. |
+| `--subtitle-language` | Ні | `all` | Мова цільової доріжки субтитрів. Передавайте параметр кілька разів або використовуйте значення, розділені комами. `all` завантажує кожну доріжку субтитрів незалежно від мови. |
+| `--output-dir` | Ні | Тимчасовий каталог ОС | Каталог, до якого витягнуті доріжки записуються перед завантаженням. У macOS і Linux це зазвичай `/tmp`; у Windows використовується стандартне розташування тимчасових файлів зі змінних середовища ОС. |
+| `--keep-extracted` | Ні | `false` | Зберігати витягнуті файли після успішного завантаження. Типово завантажені витягнуті файли видаляються. |
+| `--visibility` | Ні | `draft` | Видимість завантажених доріжок: `draft` або `public`. |
+| `--verbose`, `--no-verbose` | Ні | `true` | Виводити докладну інформацію про виявлення файлів, результати витягання та очищення. Дані про виявлення й витягання показуються у таблицях. Скористайтеся `--no-verbose`, щоб вимкнути докладний вивід. |
 
-Language filters are normalized, and common aliases are supported for languages such as `uk`, `ukr`, and `ukrainian`.
+Мовні фільтри нормалізуються, а для мов на кшталт `uk`, `ukr` та `ukrainian` підтримуються поширені псевдоніми.
 
-## Easiest Way to Run (macOS and Linux)
+## Найпростіший спосіб запуску (macOS і Linux)
 
-Install and start [Docker](https://www.docker.com/get-started/) first. Then download the helper script and make it executable:
+Спочатку встановіть і запустіть [Docker](https://www.docker.com/get-started/). Потім завантажте допоміжний скрипт і дозвольте його виконання:
 
 ```bash
 curl -fsSLO https://raw.githubusercontent.com/sirko-ua/audio-bucket-uploader/main/scripts/ukrab-uploader.sh
 chmod +x ukrab-uploader.sh
 ```
 
-Or, with `wget`:
+Або скористайтеся `wget`:
 
 ```bash
 wget https://raw.githubusercontent.com/sirko-ua/audio-bucket-uploader/main/scripts/ukrab-uploader.sh
 chmod +x ukrab-uploader.sh
 ```
 
-Run it with your API key and either one `.mkv` file or a directory of `.mkv` files. Directories are scanned recursively:
+Запустіть його з вашим API-ключем і шляхом до одного файлу `.mkv` або каталогу з файлами `.mkv`. Каталоги скануються рекурсивно:
 
 ```bash
 ./ukrab-uploader.sh <your_api_key> /path/to/movie-or-directory
 ```
 
-Uploads are public by default. To create drafts instead, add `draft`:
+Типово завантаження є публічними. Щоб натомість створювати чернетки, додайте `draft`:
 
 ```bash
 ./ukrab-uploader.sh <your_api_key> /path/to/movie-or-directory draft
 ```
 
-The named form also works: `./ukrab-uploader.sh --api-key <your_api_key> --input /path/to/movie-or-directory --visibility draft`. The helper pulls `ghcr.io/sirko-ua/audio-bucket-uploader:latest` automatically when needed and uses `https://ukrab.work/api/uploader`. It keeps the standard uploader defaults: Ukrainian audio, all subtitles, temporary extracted files, and verbose output.
+Також працює форма з іменованими параметрами: `./ukrab-uploader.sh --api-key <your_api_key> --input /path/to/movie-or-directory --visibility draft`. Допоміжний скрипт автоматично завантажує образ `ghcr.io/sirko-ua/audio-bucket-uploader:latest`, коли це потрібно, і використовує `https://ukrab.work/api/uploader`. Він зберігає стандартні значення завантажувача: українська аудіодоріжка, усі субтитри, тимчасові витягнуті файли та докладний вивід.
 
-## Easiest Way to Run (Windows)
+## Найпростіший спосіб запуску (Windows)
 
-Install and start [Docker Desktop](https://www.docker.com/products/docker-desktop/) first. In PowerShell, download the Windows helper script:
+Спочатку встановіть і запустіть [Docker Desktop](https://www.docker.com/products/docker-desktop/). У PowerShell завантажте допоміжний скрипт для Windows:
 
 ```powershell
 Invoke-WebRequest https://raw.githubusercontent.com/sirko-ua/audio-bucket-uploader/main/scripts/ukrab-uploader.bat -OutFile ukrab-uploader.bat
 ```
 
-Run it with your API key and the path to one `.mkv` file or a directory of `.mkv` files:
+Запустіть його з вашим API-ключем і шляхом до одного файлу `.mkv` або каталогу з файлами `.mkv`:
 
 ```powershell
 .\ukrab-uploader.bat <your_api_key> "C:\path\to\movie-or-directory"
 ```
 
-Uploads are public by default. Add `draft` as the final argument to create drafts instead:
+Типово завантаження є публічними. Додайте `draft` як останній аргумент, щоб натомість створювати чернетки:
 
 ```powershell
 .\ukrab-uploader.bat <your_api_key> "C:\path\to\movie-or-directory" draft
 ```
 
-The named form also works: `.\ukrab-uploader.bat --api-key <your_api_key> --input "C:\path\to\movie-or-directory" --visibility draft`.
+Також працює форма з іменованими параметрами: `.\ukrab-uploader.bat --api-key <your_api_key> --input "C:\path\to\movie-or-directory" --visibility draft`.
 
-## Run With Docker Directly
+## Запуск Docker безпосередньо
 
-Pull the published image:
+Завантажте опублікований образ:
 
 ```bash
 docker pull ghcr.io/sirko-ua/audio-bucket-uploader:latest
 ```
 
-Minimum required parameters:
+Мінімально необхідні параметри:
 
 ```bash
 docker run --rm \
@@ -104,9 +104,9 @@ docker run --rm \
   --api-url https://audio-bucket.site/api/uploader
 ```
 
-This uses the default `--input /input`, so the uploader scans the mounted movie directory.
+Тут використовується типове значення `--input /input`, тому завантажувач сканує змонтований каталог із фільмами.
 
-Full version with all available parameters:
+Повна команда з усіма доступними параметрами:
 
 ```bash
 docker run --rm \
@@ -124,15 +124,15 @@ docker run --rm \
   --verbose
 ```
 
-## Run Locally
+## Локальний запуск
 
-Install Python dependencies first:
+Спочатку встановіть залежності Python:
 
 ```bash
 python -m pip install -r requirements.txt
 ```
 
-Minimum required parameters:
+Мінімально необхідні параметри:
 
 ```bash
 python -m uploader \
@@ -140,7 +140,7 @@ python -m uploader \
   --api-url https://audio-bucket.site/api/uploader
 ```
 
-Full version:
+Повна команда:
 
 ```bash
 python -m uploader \

@@ -9,6 +9,7 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
+import blake3
 import httpx
 
 
@@ -55,7 +56,7 @@ DEFAULT_AUDIO_LANGUAGES = ["uk"]
 DEFAULT_SUBTITLE_LANGUAGES = ["all"]
 DEFAULT_INPUT = "/input"
 DEFAULT_VERBOSE = True
-DEFAULT_VISIBILITY = "draft"
+DEFAULT_VISIBILITY = "public"
 
 
 class UploaderError(RuntimeError):
@@ -153,7 +154,7 @@ def parse_args() -> argparse.Namespace:
         "--visibility",
         choices=("draft", "public"),
         default=DEFAULT_VISIBILITY,
-        help="Visibility for uploaded tracks. Defaults to draft.",
+        help="Visibility for uploaded tracks. Defaults to public.",
     )
     parser.add_argument(
         "--verbose",
@@ -445,6 +446,46 @@ def extract_tracks(file_path: Path, prepared_tracks: list[PreparedTrack]) -> Non
     run_command(command)
 
 
+def get_file_hash(file_path: Path) -> str:
+    digest = blake3.blake3()
+    with file_path.open("rb") as file_obj:
+        for chunk in iter(lambda: file_obj.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def is_track_already_published(api_url: str, api_key: str, file_path: Path) -> bool:
+    file_hash = get_file_hash(file_path)
+    check_url = f"{api_url.rstrip('/')}/hash-check"
+    try:
+        response = httpx.post(
+            check_url,
+            headers={"Authorization": f"Bearer {api_key}"},
+            json={
+                "file_hash": file_hash,
+                "file_hash_algorithm": "blake3-256",
+            },
+            timeout=60.0,
+        )
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        raise UploaderError(
+            f"Hash check failed for {file_path.name}: "
+            f"HTTP {exc.response.status_code} {exc.response.text}"
+        ) from exc
+    except httpx.HTTPError as exc:
+        raise UploaderError(f"Hash check failed for {file_path.name}: {exc}") from exc
+
+    try:
+        payload = response.json()
+    except json.JSONDecodeError as exc:
+        raise UploaderError(f"Hash check response was not valid JSON for {file_path.name}") from exc
+
+    if not isinstance(payload, dict) or not isinstance(payload.get("exists"), bool):
+        raise UploaderError(f"Hash check response did not contain a boolean 'exists' value for {file_path.name}")
+    return payload["exists"]
+
+
 def upload_prepared_track(
     api_url: str,
     api_key: str,
@@ -556,6 +597,7 @@ def main() -> int:
 
     extracted_count = 0
     uploaded_count = 0
+    skipped_count = 0
     for file_path in mkv_files:
         log(f"Inspecting {file_path}", verbose=args.verbose)
         prepared_tracks = build_prepared_tracks(file_path, output_dir, target_languages_by_type)
@@ -588,6 +630,10 @@ def main() -> int:
             verbose=args.verbose,
         )
         for prepared_track in prepared_tracks:
+            if is_track_already_published(args.api_url, args.api_key, prepared_track.output_path):
+                skipped_count += 1
+                print(f"Track {prepared_track.output_path.name} already published; skipping upload.")
+                continue
             upload_response = upload_prepared_track(
                 args.api_url,
                 args.api_key,
@@ -600,7 +646,10 @@ def main() -> int:
                 remove_extracted_file(prepared_track)
                 log(f"Removed extracted file {prepared_track.output_path}", verbose=args.verbose)
 
-    print(f"Prepared {extracted_count} extracted track file(s). Uploaded {uploaded_count} {args.visibility} track(s).")
+    print(
+        f"Prepared {extracted_count} extracted track file(s). Uploaded {uploaded_count} {args.visibility} track(s). "
+        f"Skipped {skipped_count} already published track(s)."
+    )
     return 0
 
 

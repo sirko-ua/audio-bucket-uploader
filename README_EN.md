@@ -13,6 +13,7 @@ Extracts audio and subtitle tracks from `.mkv` files by language and uploads the
 ```
 
 - uploads each extracted track to Audio Bucket as a draft or public track through `POST /api/uploader`
+- computes a BLAKE3-256 hash and checks `POST /api/uploader/hash-check` before uploading to prevent duplicates
 - sends the extracted `media_file`, original MKV MediaInfo JSON/text, MediaInfo `ID` as `track_id_inside_container`, and the selected `visibility` in the upload request
 - shows per-file extraction progress and per-file upload progress while each extracted track is being sent
 - prints verbose detection and extraction results as tables
@@ -29,10 +30,16 @@ Extracts audio and subtitle tracks from `.mkv` files by language and uploads the
 | `--subtitle-language` | No | `all` | Target subtitle track language. Pass it multiple times or use comma-separated values. `all` uploads every subtitle track regardless of language. |
 | `--output-dir` | No | OS-specific temp directory | Directory where extracted tracks are written before upload. On macOS and Linux this is typically `/tmp`; on Windows it follows the standard temp location from the OS environment. |
 | `--keep-extracted` | No | `false` | Keep extracted files after successful upload. By default, uploaded extracted files are deleted. |
-| `--visibility` | No | `draft` | Visibility for uploaded tracks: `draft` or `public`. |
+| `--visibility` | No | `public` | Visibility for uploaded tracks: `draft` or `public`. |
 | `--verbose`, `--no-verbose` | No | `true` | Print detailed file detection, extraction results, and cleanup output. Detection and extraction details are shown as tables. Use `--no-verbose` to disable it. |
 
 Language filters are normalized, and common aliases are supported for languages such as `uk`, `ukr`, and `ukrainian`.
+
+## Duplicate Check
+
+Before each upload, the uploader computes the extracted file’s 64-character BLAKE3-256 digest and sends it to `POST /api/uploader/hash-check`. If the API returns `{"exists": true}`, the file is treated as already published and the upload is skipped.
+
+The duplicate check is based only on the file hash and is not affected by `--visibility`: it runs the same way for both `public` and `draft`. The `--visibility` value is used only for an actual upload after the API returns `{"exists": false}`. Therefore, rerunning with a different visibility also skips the file if the API already finds that hash.
 
 ## Easiest Way to Run (macOS and Linux)
 

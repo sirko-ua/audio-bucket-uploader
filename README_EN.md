@@ -17,6 +17,7 @@ Extracts audio and subtitle tracks from `.mkv` files by language and uploads the
 - shows per-file extraction progress and per-file upload progress while each extracted track is being sent
 - prints verbose detection and extraction results as tables
 - removes each extracted file after a successful upload unless `--keep-extracted` is set
+- optionally also uploads standalone (loose) audio and subtitle files found next to their source video (see [Standalone files](#standalone-files))
 
 ## Arguments
 
@@ -30,9 +31,25 @@ Extracts audio and subtitle tracks from `.mkv` files by language and uploads the
 | `--output-dir` | No | OS-specific temp directory | Directory where extracted tracks are written before upload. On macOS and Linux this is typically `/tmp`; on Windows it follows the standard temp location from the OS environment. |
 | `--keep-extracted` | No | `false` | Keep extracted files after successful upload. By default, uploaded extracted files are deleted. |
 | `--visibility` | No | `draft` | Visibility for uploaded tracks: `draft` or `public`. |
+| `--standalone`, `--no-standalone` | No | `true` | Also discover and upload standalone (loose) audio/subtitle files. See [Standalone files](#standalone-files). Use `--no-standalone` to process `.mkv` files only. |
 | `--verbose`, `--no-verbose` | No | `true` | Print detailed file detection, extraction results, and cleanup output. Detection and extraction details are shown as tables. Use `--no-verbose` to disable it. |
 
 Language filters are normalized, and common aliases are supported for languages such as `uk`, `ukr`, and `ukrainian`.
+
+## Standalone files
+
+With `--standalone` (the default) the uploader also picks up loose audio and subtitle files, not just tracks inside `.mkv` containers:
+
+- **Audio:** `wav`, `mp3`, `aac`, `flac`, `ogg`, `m4a`, `opus`, `ac3`, `eac3`, `ac4`, `dts`, `dtshd`, `truehd`, `mlp`, `thd`
+- **Subtitles:** `ass`, `srt`, `pgs`, `sup`
+
+The uploader endpoint identifies a track by the source video's MediaInfo `unique_id` and reads the track language from that video's MediaInfo. A standalone file is therefore uploaded only when all of the following hold, and is otherwise skipped with a printed reason:
+
+1. Its language can be determined from the file name (e.g. `Movie.uk.srt`, `Show.en-GB.forced.srt`) or from MediaInfo.
+2. A **sibling video** with the same base name sits in the same directory (e.g. `Movie.mkv` next to `Movie.uk.srt`, or `Movie.mkv` next to `Movie_track2.eac3`). The video must expose a MediaInfo `unique_id` — `.mkv` does; most `.mp4` files do not.
+3. That video contains a track of the **same type and language** to attach the file to.
+
+Standalone source files are never deleted (`--keep-extracted` does not apply to them).
 
 ## Easiest Way to Run (macOS and Linux)
 

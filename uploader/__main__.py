@@ -56,21 +56,48 @@ DEFAULT_SUBTITLE_LANGUAGES = ["all"]
 DEFAULT_INPUT = "/input"
 DEFAULT_VERBOSE = True
 DEFAULT_VISIBILITY = "draft"
+DEFAULT_STANDALONE = True
+
+# Standalone (loose) media files that are uploaded directly rather than
+# extracted from an MKV container. Extensions are matched case-insensitively.
+STANDALONE_AUDIO_EXTENSIONS = {
+    "wav", "mp3", "aac", "flac", "ogg", "m4a", "opus",
+    "ac3", "eac3", "ac4", "dts", "dtshd", "truehd", "mlp", "thd",
+}
+STANDALONE_SUBTITLE_EXTENSIONS = {"ass", "srt", "pgs", "sup"}
+
+# Video container extensions whose MediaInfo can supply the source video's
+# unique_id that the uploader endpoint requires for a standalone track.
+VIDEO_CONTAINER_EXTENSIONS = {
+    ".mkv", ".mp4", ".m4v", ".webm", ".avi", ".mov", ".ts", ".m2ts", ".mpg", ".mpeg",
+}
+
+# token (already normalized) -> canonical language, built from LANGUAGE_ALIASES.
+LANGUAGE_TOKEN_LOOKUP: dict[str, str] = {}
+for _canonical, _aliases in LANGUAGE_ALIASES.items():
+    LANGUAGE_TOKEN_LOOKUP[_canonical] = _canonical
+    for _alias in _aliases:
+        LANGUAGE_TOKEN_LOOKUP[_alias] = _canonical
 
 
 class UploaderError(RuntimeError):
     pass
 
 
+class StandaloneSkip(Exception):
+    """Raised when a standalone file is intentionally skipped (not an error)."""
+
+
 @dataclass
 class PreparedTrack:
-    extraction_track_id: int
+    extraction_track_id: int | None
     media_info_track_id: str
     track_type: str
     language: str
     original_video_mediainfo: dict
     original_video_mediainfo_text: str
     output_path: Path
+    cleanup_after_upload: bool = True
 
 
 class ProgressFile:
@@ -156,6 +183,22 @@ def parse_args() -> argparse.Namespace:
         help="Visibility for uploaded tracks. Defaults to draft.",
     )
     parser.add_argument(
+        "--standalone",
+        action=argparse.BooleanOptionalAction,
+        default=DEFAULT_STANDALONE,
+        help=(
+            "Also discover and upload standalone audio/subtitle files found next to "
+            "or instead of MKV files (audio: "
+            f"{', '.join(sorted(STANDALONE_AUDIO_EXTENSIONS))}; subtitles: "
+            f"{', '.join(sorted(STANDALONE_SUBTITLE_EXTENSIONS))}). "
+            "Language is taken from the file name (e.g. movie.uk.srt) or MediaInfo, and "
+            "the file is attached to a sibling video (same base name) that supplies the "
+            "required source MediaInfo; files without a determinable language or sibling "
+            "video are skipped. Standalone source files are never deleted. Defaults to "
+            "true; use --no-standalone to disable."
+        ),
+    )
+    parser.add_argument(
         "--verbose",
         action=argparse.BooleanOptionalAction,
         default=DEFAULT_VERBOSE,
@@ -165,7 +208,9 @@ def parse_args() -> argparse.Namespace:
 
 
 def run_json_command(command: list[str]) -> dict:
-    completed = subprocess.run(command, capture_output=True, text=True, check=True)
+    completed = subprocess.run(
+        command, capture_output=True, text=True, encoding="utf-8", check=True
+    )
     try:
         return json.loads(completed.stdout)
     except json.JSONDecodeError as exc:
@@ -173,7 +218,9 @@ def run_json_command(command: list[str]) -> dict:
 
 
 def run_text_command(command: list[str]) -> str:
-    completed = subprocess.run(command, capture_output=True, text=True, check=True)
+    completed = subprocess.run(
+        command, capture_output=True, text=True, encoding="utf-8", check=True
+    )
     return completed.stdout
 
 
@@ -346,6 +393,15 @@ def get_media_info_track_id(media_info_track: dict | None, mkvmerge_track: dict)
     raise UploaderError(f"Cannot find MediaInfo ID for container track {mkvmerge_track.get('id')}")
 
 
+def media_info_has_unique_id(media_info_payload: dict) -> bool:
+    for track in media_info_payload.get("media", {}).get("track", []):
+        if str(track.get("@type", "")).lower() == "general":
+            unique_id = get_media_info_value(track, "unique_id", "UniqueID")
+            if not is_missing_media_info_value(unique_id):
+                return True
+    return False
+
+
 def collect_media_info(file_path: Path) -> tuple[dict[str, list[dict]], dict, str, dict]:
     media_info_payload = run_json_command(["mediainfo", "--Output=JSON", str(file_path)])
     media_info_text = run_text_command(["mediainfo", str(file_path)])
@@ -435,11 +491,226 @@ def discover_mkv_files(input_path: Path) -> list[Path]:
     )
 
 
+def file_extension(file_path: Path) -> str:
+    return file_path.suffix.lower().lstrip(".")
+
+
+def standalone_track_type(file_path: Path) -> str | None:
+    extension = file_extension(file_path)
+    if extension in STANDALONE_AUDIO_EXTENSIONS:
+        return "audio"
+    if extension in STANDALONE_SUBTITLE_EXTENSIONS:
+        return "subtitles"
+    return None
+
+
+def is_standalone_file(file_path: Path) -> bool:
+    return standalone_track_type(file_path) is not None
+
+
+def discover_standalone_files(input_path: Path) -> list[Path]:
+    if input_path.is_file():
+        return [input_path] if is_standalone_file(input_path) else []
+    return sorted(
+        path
+        for path in input_path.rglob("*")
+        if path.is_file() and is_standalone_file(path)
+    )
+
+
+def guess_language_from_filename(file_path: Path) -> str:
+    """Best-effort language from dot-separated file-name tags, e.g.
+    ``Movie.uk.DUBTITLE.subtitles.srt`` -> ``uk`` or ``Movie.en-GB.srt`` -> ``en``.
+
+    Only the trailing tag components are inspected (the leading component is the
+    title), and only short language codes (<= 3 chars, e.g. uk/en/eng/ukr) count,
+    so descriptor words (subtitles, closedcaptions) and dotted title words
+    (The.Italian.Job) do not produce false positives.
+    """
+    components = file_path.stem.split(".")
+    tag_components = components[1:] if len(components) > 1 else []
+    for component in reversed(tag_components):
+        for token in re.split(r"[^A-Za-z0-9]+", component):
+            normalized = normalize_language(token)
+            if not normalized or len(normalized) > 3:
+                continue
+            canonical = LANGUAGE_TOKEN_LOOKUP.get(normalized)
+            if canonical:
+                return canonical
+    return ""
+
+
+def detect_standalone_language(media_info_track: dict | None, file_path: Path) -> str:
+    media_info_language = get_media_info_value(media_info_track, "language", "Language")
+    if media_info_language:
+        normalized = normalize_language(str(media_info_language))
+        if normalized:
+            return normalized
+    return guess_language_from_filename(file_path)
+
+
+def collect_standalone_media_info(file_path: Path) -> tuple[dict, str, dict[str, list[dict]]]:
+    media_info_payload = run_json_command(["mediainfo", "--Output=JSON", str(file_path)])
+    media_info_text = run_text_command(["mediainfo", str(file_path)])
+    tracks_by_type: dict[str, list[dict]] = {"video": [], "audio": [], "text": []}
+    for track in media_info_payload.get("media", {}).get("track", []):
+        track_type = str(track.get("@type", "")).lower()
+        if track_type in tracks_by_type:
+            tracks_by_type[track_type].append(track)
+    return media_info_payload, media_info_text, tracks_by_type
+
+
+def find_source_video(standalone_path: Path) -> Path | None:
+    """Find the sibling video whose MediaInfo describes this standalone track.
+
+    Downloaders name loose tracks after their video, e.g. ``Movie.mkv`` next to
+    ``Movie.en.srt`` or ``Movie_track2_[und].aac``. The video's stem is therefore
+    a prefix of the standalone file's stem. The uploader endpoint needs the
+    source video's General ``unique_id``, so a matching video must be found.
+    """
+    directory = standalone_path.parent
+    stem_lower = standalone_path.stem.lower()
+    matches: list[Path] = []
+    try:
+        candidates = list(directory.iterdir())
+    except OSError:
+        return None
+    for candidate in candidates:
+        if not candidate.is_file() or candidate.suffix.lower() not in VIDEO_CONTAINER_EXTENSIONS:
+            continue
+        candidate_stem = candidate.stem.lower()
+        if not candidate_stem:
+            continue
+        remainder = stem_lower[len(candidate_stem):]
+        if stem_lower == candidate_stem or (
+            stem_lower.startswith(candidate_stem) and remainder[:1] in {".", "_", "-", " ", "["}
+        ):
+            matches.append(candidate)
+    if not matches:
+        return None
+    # Prefer MKV (reliably carries a container unique_id), then the longest
+    # (most specific) matching stem.
+    matches.sort(key=lambda path: (path.suffix.lower() == ".mkv", len(path.stem)), reverse=True)
+    return matches[0]
+
+
+def choose_container_track_id(
+    mkvmerge_payload: dict,
+    media_info_by_type: dict[str, list[dict]],
+    track_type: str,
+    language: str,
+) -> str | None:
+    """Find a track_id_inside_container in the source video for a standalone track.
+
+    The endpoint reads the language of this track from the supplied MediaInfo, so
+    the chosen container track must be the same type and resolve to the standalone
+    file's language. Returns None when the source video has no such track.
+    """
+    media_info_type = "audio" if track_type == "audio" else "text"
+    type_index = 0
+    for track in mkvmerge_payload.get("tracks", []):
+        container_type = track.get("type")
+        if container_type not in {"audio", "subtitles"}:
+            continue
+        index = type_index if container_type == track_type else None
+        if container_type == track_type:
+            type_index += 1
+        if index is None:
+            continue
+        media_info_track = find_media_info_track(media_info_by_type, track, media_info_type, index)
+        media_info_language = get_media_info_value(media_info_track, "language", "Language")
+        properties = track.get("properties", {})
+        candidate_languages = [
+            str(media_info_language or ""),
+            str(properties.get("language") or ""),
+            str(properties.get("language_ietf") or ""),
+            str(properties.get("track_name") or ""),
+        ]
+        if not media_info_language or not language_matches([language], candidate_languages):
+            continue
+        try:
+            return get_media_info_track_id(media_info_track, track)
+        except UploaderError:
+            continue
+    return None
+
+
+def build_standalone_track(
+    file_path: Path,
+    target_languages_by_type: dict[str, list[str]],
+) -> PreparedTrack:
+    track_type = standalone_track_type(file_path)
+    if track_type is None:
+        raise StandaloneSkip(f"unsupported extension {file_path.suffix}")
+
+    _, _, own_tracks_by_type = collect_standalone_media_info(file_path)
+    media_info_type = "audio" if track_type == "audio" else "text"
+    own_media_info_track = (
+        own_tracks_by_type[media_info_type][0] if own_tracks_by_type[media_info_type] else None
+    )
+    detected_language = detect_standalone_language(own_media_info_track, file_path)
+    target_languages = target_languages_by_type[track_type]
+
+    # The endpoint requires a parseable track language, so a file whose language
+    # cannot be determined (from MediaInfo or its name) cannot be uploaded.
+    if not detected_language:
+        raise StandaloneSkip(
+            "could not determine a track language (required by the uploader endpoint); "
+            "name the file with a language tag such as .uk or .en"
+        )
+
+    if track_type == "audio":
+        matches_language = language_matches(target_languages, [detected_language])
+    else:
+        matches_language = target_languages == [ALL_SUBTITLE_LANGUAGES] or (
+            subtitle_language_matches(target_languages, [detected_language])
+        )
+    if not matches_language:
+        requested = "all" if target_languages == [ALL_SUBTITLE_LANGUAGES] else ", ".join(target_languages)
+        raise StandaloneSkip(f"language {detected_language!r} not in requested {requested}")
+
+    source_video = find_source_video(file_path)
+    if source_video is None:
+        raise StandaloneSkip(
+            "no sibling video found to supply the source MediaInfo unique_id "
+            "required by the uploader endpoint"
+        )
+
+    media_info_by_type, video_payload, video_text, mkvmerge_payload = collect_media_info(source_video)
+    if not media_info_has_unique_id(video_payload):
+        raise StandaloneSkip(
+            f"source video {source_video.name} has no MediaInfo unique_id "
+            "(e.g. an MP4 container); cannot attach a standalone track to it"
+        )
+    media_info_track_id = choose_container_track_id(
+        mkvmerge_payload, media_info_by_type, track_type, detected_language
+    )
+    if media_info_track_id is None:
+        raise StandaloneSkip(
+            f"source video {source_video.name} has no {track_type} track in "
+            f"language {detected_language!r} to attach this file to"
+        )
+
+    language = normalize_language(detected_language) or "und"
+
+    return PreparedTrack(
+        extraction_track_id=None,
+        media_info_track_id=media_info_track_id,
+        track_type=track_type,
+        language=language,
+        original_video_mediainfo=video_payload,
+        original_video_mediainfo_text=video_text,
+        output_path=file_path,
+        cleanup_after_upload=False,
+    )
+
+
 def extract_tracks(file_path: Path, prepared_tracks: list[PreparedTrack]) -> None:
-    if not prepared_tracks:
+    extractable = [track for track in prepared_tracks if track.extraction_track_id is not None]
+    if not extractable:
         return
     command = ["mkvextract", "tracks", str(file_path)]
-    for prepared_track in prepared_tracks:
+    for prepared_track in extractable:
         prepared_track.output_path.parent.mkdir(parents=True, exist_ok=True)
         command.append(f"{prepared_track.extraction_track_id}:{prepared_track.output_path}")
     run_command(command)
@@ -531,6 +802,11 @@ def remove_extracted_file(prepared_track: PreparedTrack) -> None:
 
 
 def main() -> int:
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(encoding="utf-8", errors="replace")
+
     args = parse_args()
     input_path = Path(args.input).expanduser().resolve()
     output_dir = (
@@ -541,53 +817,111 @@ def main() -> int:
         "subtitles": parse_subtitle_language_filters(args.subtitle_languages),
     }
 
-    mkv_files = discover_mkv_files(input_path)
-    if not mkv_files:
-        raise UploaderError(f"No .mkv files found at: {input_path}")
+    if not input_path.exists():
+        raise UploaderError(f"Input path does not exist: {input_path}")
 
-    log(f"Uploading extracted tracks to {args.api_url}", verbose=args.verbose)
-    print(f"Found {len(mkv_files)} MKV file(s).")
+    standalone_files: list[Path] = []
+    if input_path.is_file():
+        if input_path.suffix.lower() == ".mkv":
+            mkv_files = [input_path]
+        elif args.standalone and is_standalone_file(input_path):
+            mkv_files = []
+            standalone_files = [input_path]
+        else:
+            raise UploaderError(
+                f"Unsupported input file: {input_path}. Expected an .mkv file"
+                + ("" if args.standalone else " (standalone uploads are disabled)")
+                + "."
+            )
+    else:
+        mkv_files = discover_mkv_files(input_path)
+        if args.standalone:
+            standalone_files = discover_standalone_files(input_path)
+
+    if not mkv_files and not standalone_files:
+        raise UploaderError(
+            f"No .mkv"
+            + (" or standalone audio/subtitle" if args.standalone else "")
+            + f" files found at: {input_path}"
+        )
+
+    log(f"Uploading tracks to {args.api_url}", verbose=args.verbose)
+    print(f"Found {len(mkv_files)} MKV file(s) and {len(standalone_files)} standalone file(s).")
     log_table(
         "Detected MKV files:",
         ["#", "file", "path"],
         [[index, file_path.name, file_path] for index, file_path in enumerate(mkv_files, start=1)],
         verbose=args.verbose,
     )
+    log_table(
+        "Detected standalone files:",
+        ["#", "file", "path"],
+        [[index, file_path.name, file_path] for index, file_path in enumerate(standalone_files, start=1)],
+        verbose=args.verbose,
+    )
 
     extracted_count = 0
     uploaded_count = 0
+    failed_files: list[tuple[Path, str]] = []
     for file_path in mkv_files:
-        log(f"Inspecting {file_path}", verbose=args.verbose)
-        prepared_tracks = build_prepared_tracks(file_path, output_dir, target_languages_by_type)
-        if not prepared_tracks:
-            subtitle_filter_label = (
-                "all"
-                if target_languages_by_type["subtitles"] == [ALL_SUBTITLE_LANGUAGES]
-                else ", ".join(target_languages_by_type["subtitles"])
-            )
-            print(
-                f"Skipping {file_path.name}: no matching audio tracks for {', '.join(target_languages_by_type['audio'])} "
-                f"or subtitle tracks for {subtitle_filter_label} found."
-            )
-            continue
-        print(f"Extracting {len(prepared_tracks)} track(s) from {file_path.name}...")
-        extract_tracks(file_path, prepared_tracks)
-        extracted_count += len(prepared_tracks)
-        log_table(
-            f"Extracted tracks for {file_path.name}:",
-            ["mediainfo_id", "type", "language", "path"],
-            [
+        try:
+            log(f"Inspecting {file_path}", verbose=args.verbose)
+            prepared_tracks = build_prepared_tracks(file_path, output_dir, target_languages_by_type)
+            if not prepared_tracks:
+                subtitle_filter_label = (
+                    "all"
+                    if target_languages_by_type["subtitles"] == [ALL_SUBTITLE_LANGUAGES]
+                    else ", ".join(target_languages_by_type["subtitles"])
+                )
+                print(
+                    f"Skipping {file_path.name}: no matching audio tracks for {', '.join(target_languages_by_type['audio'])} "
+                    f"or subtitle tracks for {subtitle_filter_label} found."
+                )
+                continue
+            print(f"Extracting {len(prepared_tracks)} track(s) from {file_path.name}...")
+            extract_tracks(file_path, prepared_tracks)
+            extracted_count += len(prepared_tracks)
+            log_table(
+                f"Extracted tracks for {file_path.name}:",
+                ["mediainfo_id", "type", "language", "path"],
                 [
-                    prepared_track.media_info_track_id,
-                    prepared_track.track_type,
-                    prepared_track.language,
-                    prepared_track.output_path,
-                ]
-                for prepared_track in prepared_tracks
-            ],
-            verbose=args.verbose,
-        )
-        for prepared_track in prepared_tracks:
+                    [
+                        prepared_track.media_info_track_id,
+                        prepared_track.track_type,
+                        prepared_track.language,
+                        prepared_track.output_path,
+                    ]
+                    for prepared_track in prepared_tracks
+                ],
+                verbose=args.verbose,
+            )
+            for prepared_track in prepared_tracks:
+                upload_response = upload_prepared_track(
+                    args.api_url,
+                    args.api_key,
+                    prepared_track,
+                    args.visibility,
+                )
+                uploaded_count += 1
+                print(f"Uploaded {prepared_track.output_path.name} as {args.visibility} track {upload_response.get('id')}")
+                if not args.keep_extracted and prepared_track.cleanup_after_upload:
+                    remove_extracted_file(prepared_track)
+                    log(f"Removed extracted file {prepared_track.output_path}", verbose=args.verbose)
+        except (UploaderError, subprocess.CalledProcessError, OSError, ValueError) as exc:
+            failed_files.append((file_path, str(exc)))
+            print(f"ERROR: skipping {file_path.name}: {exc}")
+            continue
+
+    standalone_uploaded_count = 0
+    standalone_skipped_count = 0
+    for file_path in standalone_files:
+        try:
+            log(f"Inspecting standalone {file_path}", verbose=args.verbose)
+            prepared_track = build_standalone_track(file_path, target_languages_by_type)
+            print(
+                f"Uploading standalone {prepared_track.track_type} "
+                f"{file_path.name} (language={prepared_track.language})..."
+            )
             upload_response = upload_prepared_track(
                 args.api_url,
                 args.api_key,
@@ -595,12 +929,27 @@ def main() -> int:
                 args.visibility,
             )
             uploaded_count += 1
-            print(f"Uploaded {prepared_track.output_path.name} as {args.visibility} track {upload_response.get('id')}")
-            if not args.keep_extracted:
-                remove_extracted_file(prepared_track)
-                log(f"Removed extracted file {prepared_track.output_path}", verbose=args.verbose)
+            standalone_uploaded_count += 1
+            print(f"Uploaded {file_path.name} as {args.visibility} track {upload_response.get('id')}")
+        except StandaloneSkip as skip:
+            standalone_skipped_count += 1
+            print(f"Skipping standalone {file_path.name}: {skip}")
+            continue
+        except (UploaderError, subprocess.CalledProcessError, OSError, ValueError) as exc:
+            failed_files.append((file_path, str(exc)))
+            print(f"ERROR: skipping {file_path.name}: {exc}")
+            continue
 
-    print(f"Prepared {extracted_count} extracted track file(s). Uploaded {uploaded_count} {args.visibility} track(s).")
+    print(
+        f"Prepared {extracted_count} extracted track file(s). "
+        f"Uploaded {uploaded_count} {args.visibility} track(s) "
+        f"({standalone_uploaded_count} standalone, {standalone_skipped_count} standalone skipped)."
+    )
+    if failed_files:
+        print(f"Encountered errors on {len(failed_files)} file(s):")
+        for file_path, message in failed_files:
+            print(f"  - {file_path.name}: {message}")
+        return 1
     return 0
 
 

@@ -34,7 +34,59 @@ Extracts audio and subtitle tracks from `.mkv` files by language and uploads the
 
 Language filters are normalized, and common aliases are supported for languages such as `uk`, `ukr`, and `ukrainian`.
 
-## Run With Docker
+## Easiest Way to Run (macOS and Linux)
+
+Install and start [Docker](https://www.docker.com/get-started/) first. Then download the helper script and make it executable:
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/sirko-ua/audio-bucket-uploader/main/scripts/ukrab-uploader.sh
+chmod +x ukrab-uploader.sh
+```
+
+Or, with `wget`:
+
+```bash
+wget https://raw.githubusercontent.com/sirko-ua/audio-bucket-uploader/main/scripts/ukrab-uploader.sh
+chmod +x ukrab-uploader.sh
+```
+
+Run it with your API key and either one `.mkv` file or a directory of `.mkv` files. Directories are scanned recursively:
+
+```bash
+./ukrab-uploader.sh <your_api_key> /path/to/movie-or-directory
+```
+
+Uploads are public by default. To create drafts instead, add `draft`:
+
+```bash
+./ukrab-uploader.sh <your_api_key> /path/to/movie-or-directory draft
+```
+
+The named form also works: `./ukrab-uploader.sh --api-key <your_api_key> --input /path/to/movie-or-directory --visibility draft`. The helper pulls `ghcr.io/sirko-ua/audio-bucket-uploader:latest` automatically when needed and uses `https://ukrab.work/api/uploader`. It keeps the standard uploader defaults: Ukrainian audio, all subtitles, temporary extracted files, and verbose output.
+
+## Easiest Way to Run (Windows)
+
+Install and start [Docker Desktop](https://www.docker.com/products/docker-desktop/) first. In PowerShell, download the Windows helper script:
+
+```powershell
+Invoke-WebRequest https://raw.githubusercontent.com/sirko-ua/audio-bucket-uploader/main/scripts/ukrab-uploader.bat -OutFile ukrab-uploader.bat
+```
+
+Run it with your API key and the path to one `.mkv` file or a directory of `.mkv` files:
+
+```powershell
+.\ukrab-uploader.bat <your_api_key> "C:\path\to\movie-or-directory"
+```
+
+Uploads are public by default. Add `draft` as the final argument to create drafts instead:
+
+```powershell
+.\ukrab-uploader.bat <your_api_key> "C:\path\to\movie-or-directory" draft
+```
+
+The named form also works: `.\ukrab-uploader.bat --api-key <your_api_key> --input "C:\path\to\movie-or-directory" --visibility draft`.
+
+## Run With Docker Directly
 
 Pull the published image:
 

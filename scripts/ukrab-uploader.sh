@@ -108,6 +108,9 @@ fi
 command -v docker >/dev/null 2>&1 || fail "Docker is not installed. Install and start Docker, then try again."
 docker info >/dev/null 2>&1 || fail "Docker is not running. Start Docker, then try again."
 
+printf '%s\n' "Pulling the latest Audio Bucket uploader image..."
+docker pull "$IMAGE"
+
 printf '%s\n' "Starting Audio Bucket uploader..."
 
 exec docker run --rm \

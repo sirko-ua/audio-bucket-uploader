@@ -9,6 +9,7 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
+import blake3
 import httpx
 
 
@@ -27,22 +28,67 @@ LANGUAGE_ALIASES = {
 CODEC_EXTENSION_MAP = {
     "aac": "aac",
     "ac3": "ac3",
-    "alac": "m4a",
+    "alac": "caf",
     "ass": "ass",
-    "e_ac_3": "eac3",
+    "dts": "dts",
     "eac3": "eac3",
     "flac": "flac",
+    "kate": "ogg",
+    "mlp": "mlp",
+    "mp2": "mp2",
+    "mp3": "mp3",
     "opus": "opus",
     "pcm": "wav",
     "pgs": "sup",
     "ssa": "ssa",
     "subrip": "srt",
-    "srt": "srt",
-    "sup": "sup",
-    "utf8": "srt",
-    "textutf8": "srt",
     "truehd": "thd",
-    "dts": "dts",
+    "tta": "tta",
+    "usf": "usf",
+    "vobsub": "sub",
+    "vorbis": "ogg",
+    "wavpack": "wv",
+    "webvtt": "webvtt",
+}
+
+CODEC_CANONICAL_ALIASES = {
+    "ac_3": "ac3",
+    "a_ac3": "ac3",
+    "a_alac": "alac",
+    "a_dts": "dts",
+    "a_eac3": "eac3",
+    "a_flac": "flac",
+    "a_mlp": "mlp",
+    "a_mpegl2": "mp2",
+    "a_mpegl3": "mp3",
+    "a_opus": "opus",
+    "a_pcmintbig": "pcm",
+    "a_pcmintlit": "pcm",
+    "a_truehd": "truehd",
+    "a_tta1": "tta",
+    "a_vorbis": "vorbis",
+    "a_wavpack4": "wavpack",
+    "dtses": "dts",
+    "dtshdhra": "dts",
+    "dtsxll": "dts",
+    "e_ac_3": "eac3",
+    "mlpfba": "mlp",
+    "mpegaudiolayer2": "mp2",
+    "mpegaudiolayer3": "mp3",
+    "s_ass": "ass",
+    "s_hdmvpgs": "pgs",
+    "s_kate": "kate",
+    "s_ssa": "ssa",
+    "s_textascii": "subrip",
+    "s_textass": "ass",
+    "s_textssa": "ssa",
+    "s_textusf": "usf",
+    "s_textutf8": "subrip",
+    "s_textwebvtt": "webvtt",
+    "s_vobsub": "vobsub",
+    "textutf8": "subrip",
+    "trueaudio": "tta",
+    "utf8": "subrip",
 }
 
 TRACK_TYPE_EXTENSION_DEFAULTS = {
@@ -55,7 +101,7 @@ DEFAULT_AUDIO_LANGUAGES = ["uk"]
 DEFAULT_SUBTITLE_LANGUAGES = ["all"]
 DEFAULT_INPUT = "/input"
 DEFAULT_VERBOSE = True
-DEFAULT_VISIBILITY = "draft"
+DEFAULT_VISIBILITY = "public"
 DEFAULT_STANDALONE = True
 
 # Standalone (loose) media files that are uploaded directly rather than
@@ -180,7 +226,7 @@ def parse_args() -> argparse.Namespace:
         "--visibility",
         choices=("draft", "public"),
         default=DEFAULT_VISIBILITY,
-        help="Visibility for uploaded tracks. Defaults to draft.",
+        help="Visibility for uploaded tracks. Defaults to public.",
     )
     parser.add_argument(
         "--standalone",
@@ -324,9 +370,11 @@ def get_media_info_value(track: dict | None, *keys: str) -> object | None:
 
 def canonicalize_codec(value: object) -> str:
     normalized = sanitize_token(str(value))
-    if normalized.startswith("subrip") or normalized in {"srt", "stextutf8", "stext_utf8", "textutf8", "text_utf8", "utf8", "utf_8"}:
+    if normalized.startswith("a_aac"):
+        return "aac"
+    if normalized.startswith("subrip") or normalized in {"srt", "stextutf8", "stext_utf8", "text_utf8", "utf_8"}:
         return "subrip"
-    return normalized
+    return CODEC_CANONICAL_ALIASES.get(normalized, normalized)
 
 
 def normalize_movie_name(file_path: Path) -> str:
@@ -337,7 +385,7 @@ def normalize_movie_name(file_path: Path) -> str:
 
 
 def detect_extension(codec: str, track_type: str) -> str:
-    normalized_codec = sanitize_token(codec)
+    normalized_codec = canonicalize_codec(codec)
     return CODEC_EXTENSION_MAP.get(normalized_codec, TRACK_TYPE_EXTENSION_DEFAULTS[track_type])
 
 
@@ -348,12 +396,16 @@ def infer_codec(track: dict, media_info_track: dict | None) -> str:
         track.get("codec"),
         track.get("properties", {}).get("codec_id"),
     ]
+    fallback_codec = "unknown"
     for candidate in candidates:
         if candidate:
             normalized = canonicalize_codec(candidate)
             if normalized != "na":
-                return normalized
-    return "unknown"
+                if normalized in CODEC_EXTENSION_MAP:
+                    return normalized
+                if fallback_codec == "unknown":
+                    fallback_codec = normalized
+    return fallback_codec
 
 
 def find_media_info_track(
@@ -716,6 +768,55 @@ def extract_tracks(file_path: Path, prepared_tracks: list[PreparedTrack]) -> Non
     run_command(command)
 
 
+def get_file_hash(file_path: Path) -> str:
+    digest = blake3.blake3()
+    with file_path.open("rb") as file_obj:
+        for chunk in iter(lambda: file_obj.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def is_track_already_published(api_url: str, api_key: str, file_path: Path, *, verbose: bool) -> bool:
+    file_hash = get_file_hash(file_path)
+    check_url = f"{api_url.rstrip('/')}/hash-check"
+    request_payload = {
+        "file_hash": file_hash,
+        "file_hash_algorithm": "blake3-256",
+    }
+    log(
+        f"Hash check request to {check_url}:\n{json.dumps(request_payload, indent=2)}",
+        verbose=verbose,
+    )
+    try:
+        response = httpx.post(
+            check_url,
+            headers={"Authorization": f"Bearer {api_key}"},
+            json=request_payload,
+            timeout=60.0,
+        )
+        log(
+            f"Hash check response ({response.status_code}):\n{response.text}",
+            verbose=verbose,
+        )
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        raise UploaderError(
+            f"Hash check failed for {file_path.name}: "
+            f"HTTP {exc.response.status_code} {exc.response.text}"
+        ) from exc
+    except httpx.HTTPError as exc:
+        raise UploaderError(f"Hash check failed for {file_path.name}: {exc}") from exc
+
+    try:
+        payload = response.json()
+    except json.JSONDecodeError as exc:
+        raise UploaderError(f"Hash check response was not valid JSON for {file_path.name}") from exc
+
+    if not isinstance(payload, dict) or not isinstance(payload.get("exists"), bool):
+        raise UploaderError(f"Hash check response did not contain a boolean 'exists' value for {file_path.name}")
+    return payload["exists"]
+
+
 def upload_prepared_track(
     api_url: str,
     api_key: str,
@@ -862,6 +963,7 @@ def main() -> int:
 
     extracted_count = 0
     uploaded_count = 0
+    skipped_count = 0
     failed_files: list[tuple[Path, str]] = []
     for file_path in mkv_files:
         try:
@@ -896,6 +998,18 @@ def main() -> int:
                 verbose=args.verbose,
             )
             for prepared_track in prepared_tracks:
+                if is_track_already_published(
+                    args.api_url,
+                    args.api_key,
+                    prepared_track.output_path,
+                    verbose=args.verbose,
+                ):
+                    skipped_count += 1
+                    print(f"Track {prepared_track.output_path.name} already published; skipping upload.")
+                    if not args.keep_extracted and prepared_track.cleanup_after_upload:
+                        remove_extracted_file(prepared_track)
+                        log(f"Removed extracted file {prepared_track.output_path}", verbose=args.verbose)
+                    continue
                 upload_response = upload_prepared_track(
                     args.api_url,
                     args.api_key,
@@ -918,6 +1032,16 @@ def main() -> int:
         try:
             log(f"Inspecting standalone {file_path}", verbose=args.verbose)
             prepared_track = build_standalone_track(file_path, target_languages_by_type)
+            if is_track_already_published(
+                args.api_url,
+                args.api_key,
+                prepared_track.output_path,
+                verbose=args.verbose,
+            ):
+                skipped_count += 1
+                standalone_skipped_count += 1
+                print(f"Track {file_path.name} already published; skipping upload.")
+                continue
             print(
                 f"Uploading standalone {prepared_track.track_type} "
                 f"{file_path.name} (language={prepared_track.language})..."
@@ -943,7 +1067,8 @@ def main() -> int:
     print(
         f"Prepared {extracted_count} extracted track file(s). "
         f"Uploaded {uploaded_count} {args.visibility} track(s) "
-        f"({standalone_uploaded_count} standalone, {standalone_skipped_count} standalone skipped)."
+        f"({standalone_uploaded_count} standalone, {standalone_skipped_count} standalone skipped). "
+        f"Skipped {skipped_count} already published track(s)."
     )
     if failed_files:
         print(f"Encountered errors on {len(failed_files)} file(s):")

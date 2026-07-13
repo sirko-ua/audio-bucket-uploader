@@ -28,22 +28,67 @@ LANGUAGE_ALIASES = {
 CODEC_EXTENSION_MAP = {
     "aac": "aac",
     "ac3": "ac3",
-    "alac": "m4a",
+    "alac": "caf",
     "ass": "ass",
-    "e_ac_3": "eac3",
+    "dts": "dts",
     "eac3": "eac3",
     "flac": "flac",
+    "kate": "ogg",
+    "mlp": "mlp",
+    "mp2": "mp2",
+    "mp3": "mp3",
     "opus": "opus",
     "pcm": "wav",
     "pgs": "sup",
     "ssa": "ssa",
     "subrip": "srt",
-    "srt": "srt",
-    "sup": "sup",
-    "utf8": "srt",
-    "textutf8": "srt",
     "truehd": "thd",
-    "dts": "dts",
+    "tta": "tta",
+    "usf": "usf",
+    "vobsub": "sub",
+    "vorbis": "ogg",
+    "wavpack": "wv",
+    "webvtt": "webvtt",
+}
+
+CODEC_CANONICAL_ALIASES = {
+    "ac_3": "ac3",
+    "a_ac3": "ac3",
+    "a_alac": "alac",
+    "a_dts": "dts",
+    "a_eac3": "eac3",
+    "a_flac": "flac",
+    "a_mlp": "mlp",
+    "a_mpegl2": "mp2",
+    "a_mpegl3": "mp3",
+    "a_opus": "opus",
+    "a_pcmintbig": "pcm",
+    "a_pcmintlit": "pcm",
+    "a_truehd": "truehd",
+    "a_tta1": "tta",
+    "a_vorbis": "vorbis",
+    "a_wavpack4": "wavpack",
+    "dtses": "dts",
+    "dtshdhra": "dts",
+    "dtsxll": "dts",
+    "e_ac_3": "eac3",
+    "mlpfba": "mlp",
+    "mpegaudiolayer2": "mp2",
+    "mpegaudiolayer3": "mp3",
+    "s_ass": "ass",
+    "s_hdmvpgs": "pgs",
+    "s_kate": "kate",
+    "s_ssa": "ssa",
+    "s_textascii": "subrip",
+    "s_textass": "ass",
+    "s_textssa": "ssa",
+    "s_textusf": "usf",
+    "s_textutf8": "subrip",
+    "s_textwebvtt": "webvtt",
+    "s_vobsub": "vobsub",
+    "textutf8": "subrip",
+    "trueaudio": "tta",
+    "utf8": "subrip",
 }
 
 TRACK_TYPE_EXTENSION_DEFAULTS = {
@@ -278,9 +323,11 @@ def get_media_info_value(track: dict | None, *keys: str) -> object | None:
 
 def canonicalize_codec(value: object) -> str:
     normalized = sanitize_token(str(value))
-    if normalized.startswith("subrip") or normalized in {"srt", "stextutf8", "stext_utf8", "textutf8", "text_utf8", "utf8", "utf_8"}:
+    if normalized.startswith("a_aac"):
+        return "aac"
+    if normalized.startswith("subrip") or normalized in {"srt", "stextutf8", "stext_utf8", "text_utf8", "utf_8"}:
         return "subrip"
-    return normalized
+    return CODEC_CANONICAL_ALIASES.get(normalized, normalized)
 
 
 def normalize_movie_name(file_path: Path) -> str:
@@ -291,7 +338,7 @@ def normalize_movie_name(file_path: Path) -> str:
 
 
 def detect_extension(codec: str, track_type: str) -> str:
-    normalized_codec = sanitize_token(codec)
+    normalized_codec = canonicalize_codec(codec)
     return CODEC_EXTENSION_MAP.get(normalized_codec, TRACK_TYPE_EXTENSION_DEFAULTS[track_type])
 
 
@@ -302,12 +349,16 @@ def infer_codec(track: dict, media_info_track: dict | None) -> str:
         track.get("codec"),
         track.get("properties", {}).get("codec_id"),
     ]
+    fallback_codec = "unknown"
     for candidate in candidates:
         if candidate:
             normalized = canonicalize_codec(candidate)
             if normalized != "na":
-                return normalized
-    return "unknown"
+                if normalized in CODEC_EXTENSION_MAP:
+                    return normalized
+                if fallback_codec == "unknown":
+                    fallback_codec = normalized
+    return fallback_codec
 
 
 def find_media_info_track(

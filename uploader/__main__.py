@@ -571,15 +571,21 @@ def discover_standalone_files(input_path: Path) -> list[Path]:
 
 
 def guess_language_from_filename(file_path: Path) -> str:
-    """Best-effort language from dot-separated file-name tags, e.g.
-    ``Movie.uk.DUBTITLE.subtitles.srt`` -> ``uk`` or ``Movie.en-GB.srt`` -> ``en``.
+    """Best-effort language from file-name tags, e.g.
+    ``Movie.uk.DUBTITLE.subtitles.srt`` -> ``uk``, ``Movie.en-GB.srt`` -> ``en``,
+    or ``Movie_track2_[ukr]_DELAY 0ms.eac3`` -> ``uk`` (mkvextract/DVDFab naming).
 
-    Only the trailing tag components are inspected (the leading component is the
-    title), and only short language codes (<= 3 chars, e.g. uk/en/eng/ukr) count,
-    so descriptor words (subtitles, closedcaptions) and dotted title words
-    (The.Italian.Job) do not produce false positives.
+    Only the trailing dot-separated tag components are inspected (the leading
+    component is the title), and only short language codes (<= 3 chars, e.g.
+    uk/en/eng/ukr) count, so descriptor words (subtitles, closedcaptions) and
+    dotted title words (The.Italian.Job) do not produce false positives.
+
+    Bracketed tags are matched anywhere in the stem, since a bracketed short code
+    is unambiguously a tag. Bare underscore-separated tokens are deliberately NOT
+    scanned: a film named "It" would make ``It_track2.eac3`` read as Italian.
     """
-    components = file_path.stem.split(".")
+    stem = file_path.stem
+    components = stem.split(".")
     tag_components = components[1:] if len(components) > 1 else []
     for component in reversed(tag_components):
         for token in re.split(r"[^A-Za-z0-9]+", component):
@@ -589,6 +595,10 @@ def guess_language_from_filename(file_path: Path) -> str:
             canonical = LANGUAGE_TOKEN_LOOKUP.get(normalized)
             if canonical:
                 return canonical
+    for token in reversed(re.findall(r"\[([A-Za-z]{2,3})\]", stem)):
+        canonical = LANGUAGE_TOKEN_LOOKUP.get(normalize_language(token))
+        if canonical:
+            return canonical
     return ""
 
 
@@ -906,7 +916,10 @@ def main() -> int:
     for stream in (sys.stdout, sys.stderr):
         reconfigure = getattr(stream, "reconfigure", None)
         if reconfigure is not None:
-            reconfigure(encoding="utf-8", errors="replace")
+            # line_buffering: Docker sets PYTHONUNBUFFERED, but a direct
+            # `python -m uploader > log` block-buffers stdout, so our progress
+            # lands in the log long after the mkvextract output it describes.
+            reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
 
     args = parse_args()
     input_path = Path(args.input).expanduser().resolve()

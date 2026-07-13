@@ -116,6 +116,10 @@ docker info >nul 2>&1 || (
     exit /b 1
 )
 
+echo Pulling the latest Audio Bucket uploader image...
+docker pull "%IMAGE%"
+if errorlevel 1 exit /b %errorlevel%
+
 echo Starting Audio Bucket uploader...
 docker run --rm --volume "%host_input%:/input:ro" "%IMAGE%" --api-key "%api_key%" --api-url "%API_URL%" --input "%container_input%" --visibility "%visibility%"
 exit /b %errorlevel%

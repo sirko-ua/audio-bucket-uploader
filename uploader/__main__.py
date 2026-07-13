@@ -697,6 +697,41 @@ def choose_container_track_id(
     return None
 
 
+def add_synthetic_media_info_track(
+    media_info_payload: dict,
+    own_media_info_track: dict | None,
+    track_type: str,
+    language: str,
+) -> str:
+    """Append the standalone file's own MediaInfo track to the source video's
+    MediaInfo, and return the container track id the endpoint should read it by.
+
+    Mutates ``media_info_payload`` (the dict sent as ``original_video_mediainfo``).
+    """
+    tracks = media_info_payload.setdefault("media", {}).setdefault("track", [])
+    used_ids = set()
+    for track in tracks:
+        value = str(get_media_info_value(track, "id", "ID") or "")
+        if value.isdigit():
+            used_ids.add(int(value))
+    new_id = max(used_ids, default=0) + 1
+
+    synthetic = dict(own_media_info_track or {})
+    synthetic.update(
+        {
+            "@type": "Text" if track_type == "subtitles" else "Audio",
+            "ID": str(new_id),
+            "StreamOrder": str(new_id - 1),
+            "Language": language,
+        }
+    )
+    # A loose file's MediaInfo carries no container-level track UID, and reusing
+    # one would collide with a real track in the container.
+    synthetic.pop("UniqueID", None)
+    tracks.append(synthetic)
+    return str(new_id)
+
+
 def build_standalone_track(
     file_path: Path,
     target_languages_by_type: dict[str, list[str]],
@@ -744,16 +779,25 @@ def build_standalone_track(
             f"source video {source_video.name} has no MediaInfo unique_id "
             "(e.g. an MP4 container); cannot attach a standalone track to it"
         )
+    language = normalize_language(detected_language) or "und"
+
     media_info_track_id = choose_container_track_id(
         mkvmerge_payload, media_info_by_type, track_type, detected_language
     )
     if media_info_track_id is None:
-        raise StandaloneSkip(
-            f"source video {source_video.name} has no {track_type} track in "
-            f"language {detected_language!r} to attach this file to"
+        # An external track (e.g. a loose .srt for a video with no embedded
+        # subtitle track) has no container track to point at, and the endpoint
+        # can only read a track's type and language from the MediaInfo we send,
+        # keyed by track_id_inside_container. So describe the loose file as a
+        # track of the source video, using its own MediaInfo. The General
+        # unique_id stays that of the real source video, so the upload still
+        # lands on the correct release.
+        # ponytail: the payload then describes a track the container does not
+        # physically contain. Drop this once the endpoint accepts an explicit
+        # track type + language for standalone files.
+        media_info_track_id = add_synthetic_media_info_track(
+            video_payload, own_media_info_track, track_type, language
         )
-
-    language = normalize_language(detected_language) or "und"
 
     return PreparedTrack(
         extraction_track_id=None,

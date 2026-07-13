@@ -44,11 +44,12 @@ With `--standalone` (the default) the uploader also picks up loose audio and sub
 - **Audio:** `wav`, `mp3`, `aac`, `flac`, `ogg`, `m4a`, `opus`, `ac3`, `eac3`, `ac4`, `dts`, `dtshd`, `truehd`, `mlp`, `thd`
 - **Subtitles:** `ass`, `srt`, `pgs`, `sup`
 
-The uploader endpoint identifies a track by the source video's MediaInfo `unique_id` and reads the track language from that video's MediaInfo. A standalone file is therefore uploaded only when all of the following hold, and is otherwise skipped with a printed reason:
+The uploader endpoint identifies a track by the source video's MediaInfo `unique_id` and reads the track's type and language from that video's MediaInfo. A standalone file is therefore uploaded only when both of the following hold, and is otherwise skipped with a printed reason:
 
-1. Its language can be determined from the file name (e.g. `Movie.uk.srt`, `Show.en-GB.forced.srt`) or from MediaInfo.
+1. Its language can be determined from the file name (e.g. `Movie.uk.srt`, `Show.en-GB.forced.srt`, `Movie_track2_[ukr]_DELAY 0ms.eac3`) or from MediaInfo.
 2. A **sibling video** with the same base name sits in the same directory (e.g. `Movie.mkv` next to `Movie.uk.srt`, or `Movie.mkv` next to `Movie_track2.eac3`). The video must expose a MediaInfo `unique_id` — `.mkv` does; most `.mp4` files do not.
-3. That video contains a track of the **same type and language** to attach the file to.
+
+The source video does **not** need to already contain a matching track. An external subtitle usually has no counterpart inside the container (`Movie.mkv` carries Ukrainian audio but no Ukrainian subtitle track), so the standalone file's own MediaInfo is appended to the source video's MediaInfo as an extra track and `track_id_inside_container` points at it. The General `unique_id` stays that of the real source video, so the upload lands on the correct release and the endpoint reads the correct type and language.
 
 Standalone source files are never deleted (`--keep-extracted` does not apply to them).
 

@@ -103,22 +103,32 @@ if /I "%visibility%"=="draft" goto validate_input
 call :fail "Visibility must be either public or draft."
 exit /b 1
 
+rem Without delayed expansion, a variable set inside a parenthesised block cannot
+rem be read inside that same block, so the single-file branch uses labels.
 :validate_input
-if exist "%input_path%\NUL" (
-    for %%I in ("%input_path%") do set "host_input=%%~fI"
-    set "container_input=/input"
-) else (
-    for %%I in ("%input_path%") do (
-        set "extension=%%~xI"
-        set "file_name=%%~nxI"
-        for %%J in ("%%~dpI.") do set "host_input=%%~fJ"
-    )
-    if /I not "%extension%"==".mkv" (
-        call :fail "Input file must have an .mkv extension: %input_path%"
-        exit /b 1
-    )
-    set "container_input=/input/%file_name%"
+rem The quoted "path\NUL" idiom never matches, so a trailing backslash it is.
+if exist "%input_path%\" goto validate_input_directory
+
+for %%I in ("%input_path%") do (
+    set "extension=%%~xI"
+    set "file_name=%%~nxI"
+    for %%J in ("%%~dpI.") do set "host_input=%%~fJ"
 )
+if /I not "%extension%"==".mkv" (
+    call :fail "Input file must have an .mkv extension: %input_path%"
+    exit /b 1
+)
+set "container_input=/input/%file_name%"
+goto validate_docker
+
+:validate_input_directory
+for %%I in ("%input_path%") do set "host_input=%%~fI"
+rem A trailing backslash would end up inside the docker --volume argument
+rem ("C:\Movies\:/input:ro"). A drive root ("X:\") has to keep it.
+if "%host_input:~-1%"=="\" if not "%host_input:~-2%"==":\" set "host_input=%host_input:~0,-1%"
+set "container_input=/input"
+
+:validate_docker
 
 where docker >nul 2>&1 || (
     call :fail "Docker is not installed. Install and start Docker, then try again."
@@ -129,12 +139,31 @@ docker info >nul 2>&1 || (
     exit /b 1
 )
 
+rem Persist the run history and failure log next to the media, so a restarted run
+rem resumes instead of re-extracting and re-hash-checking everything. One state
+rem dir per library, always: inside the container every library is mounted at
+rem /input, so a shared state dir would let a mirrored library (same relative
+rem path, same size, same mtime) be skipped as "already done" and never uploaded.
+rem A drive root ("X:\") already ends in a separator; anything else needs one.
+set "state_dir=%host_input%\.audio-bucket-uploader"
+if "%host_input:~-1%"=="\" set "state_dir=%host_input%.audio-bucket-uploader"
+if not exist "%state_dir%" mkdir "%state_dir%" 2>nul
+if exist "%state_dir%" goto state_dir_ready
+
+set "library_id=%host_input:\=_%"
+set "library_id=%library_id::=_%"
+set "library_id=%library_id: =_%"
+set "state_dir=%USERPROFILE%\.audio-bucket-uploader\%library_id%"
+if not exist "%state_dir%" mkdir "%state_dir%"
+
+:state_dir_ready
+
 echo Pulling the latest Audio Bucket uploader image...
 docker pull "%IMAGE%"
 if errorlevel 1 exit /b %errorlevel%
 
 echo Starting Audio Bucket uploader...
-docker run --rm --volume "%host_input%:/input:ro" "%IMAGE%" --api-key "%api_key%" --api-url "%API_URL%" --input "%container_input%" --visibility "%visibility%" %verbosity_flag%
+docker run --rm --volume "%host_input%:/input:ro" --volume "%state_dir%:/state" "%IMAGE%" --api-key "%api_key%" --api-url "%API_URL%" --input "%container_input%" --visibility "%visibility%" %verbosity_flag%
 exit /b %errorlevel%
 
 :usage

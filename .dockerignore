@@ -1,0 +1,31 @@
+# Keep the Docker build context minimal and free of secrets.
+.git
+.gitignore
+.dockerignore
+.github/
+.idea/
+.vscode/
+
+# Secrets / local config
+.env
+.env.*
+!.env.example
+
+# Python caches / build artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
+
+# Local run output and docs not needed in the image
+extracted/
+*.log
+README*.md
+LICENSE
+scripts/

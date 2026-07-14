@@ -16,7 +16,7 @@ Extracts audio and subtitle tracks from `.mkv` files by language and uploads the
 - computes a BLAKE3-256 hash and checks `POST /api/uploader/hash-check` before uploading to prevent duplicates
 - sends the extracted `media_file`, original MKV MediaInfo JSON/text, MediaInfo `ID` as `track_id_inside_container`, and the selected `visibility` in the upload request
 - shows per-file extraction progress and per-file upload progress while each extracted track is being sent
-- prints verbose detection and extraction results as tables
+- with `--verbose`, prints detailed detection, HTTP request, upload result, and cleanup events
 - removes each extracted file after a successful upload unless `--keep-extracted` is set
 - optionally also uploads standalone (loose) audio and subtitle files found next to their source video (see [Standalone files](#standalone-files))
 
@@ -33,7 +33,7 @@ Extracts audio and subtitle tracks from `.mkv` files by language and uploads the
 | `--keep-extracted` | No | `false` | Keep extracted files after successful upload. By default, uploaded extracted files are deleted. |
 | `--visibility` | No | `public` | Visibility for uploaded tracks: `draft` or `public`. |
 | `--standalone`, `--no-standalone` | No | `true` | Also discover and upload standalone (loose) audio/subtitle files. See [Standalone files](#standalone-files). Use `--no-standalone` to process `.mkv` files only. |
-| `--verbose`, `--no-verbose` | No | `true` | Print detailed file detection, extraction results, and cleanup output. Detection and extraction details are shown as tables. Use `--no-verbose` to disable it. |
+| `--verbose`, `--no-verbose` | No | `false` | Print detailed file detection, HTTP request, upload result, and cleanup output. Detected files are shown as one-column full-path tables. Requests show only the method, path, response code, or exception—never their bodies. |
 
 Language filters are normalized, and common aliases are supported for languages such as `uk`, `ukr`, and `ukrainian`.
 
@@ -89,7 +89,7 @@ Uploads are public by default. To create drafts instead, add `draft`:
 ./ukrab-uploader.sh <your_api_key> /path/to/movie-or-directory draft
 ```
 
-The named form also works: `./ukrab-uploader.sh --api-key <your_api_key> --input /path/to/movie-or-directory --visibility draft`. The helper pulls `ghcr.io/sirko-ua/audio-bucket-uploader:latest` automatically when needed and uses `https://ukrab.work/api/uploader`. It keeps the standard uploader defaults: Ukrainian audio, all subtitles, temporary extracted files, and verbose output.
+The named form also works: `./ukrab-uploader.sh --api-key <your_api_key> --input /path/to/movie-or-directory --visibility draft`. Add `--verbose` to either form for detailed output (or `--no-verbose` to explicitly select concise output). The helper pulls `ghcr.io/sirko-ua/audio-bucket-uploader:latest` automatically when needed and uses `https://ukrab.work/api/uploader`. It keeps the standard uploader defaults: Ukrainian audio, all subtitles, temporary extracted files, and concise output.
 
 ## Easiest Way to Run (Windows)
 
@@ -111,7 +111,7 @@ Uploads are public by default. Add `draft` as the final argument to create draft
 .\ukrab-uploader.bat <your_api_key> "C:\path\to\movie-or-directory" draft
 ```
 
-The named form also works: `.\ukrab-uploader.bat --api-key <your_api_key> --input "C:\path\to\movie-or-directory" --visibility draft`.
+The named form also works: `.\ukrab-uploader.bat --api-key <your_api_key> --input "C:\path\to\movie-or-directory" --visibility draft`. Add `--verbose` to either form for detailed output (or `--no-verbose` to explicitly select concise output).
 
 ## Run With Docker Directly
 

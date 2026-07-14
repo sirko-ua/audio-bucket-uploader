@@ -7,7 +7,9 @@ import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
 import blake3
 import httpx
@@ -100,7 +102,7 @@ ALL_SUBTITLE_LANGUAGES = "__all_subtitle_languages__"
 DEFAULT_AUDIO_LANGUAGES = ["uk"]
 DEFAULT_SUBTITLE_LANGUAGES = ["all"]
 DEFAULT_INPUT = "/input"
-DEFAULT_VERBOSE = True
+DEFAULT_VERBOSE = False
 DEFAULT_VISIBILITY = "public"
 DEFAULT_STANDALONE = True
 
@@ -153,6 +155,7 @@ class ProgressFile:
         self._label = label
         self._uploaded = 0
         self._last_percent = -1
+        self._line_open = False
 
     def read(self, size: int = -1) -> bytes:
         chunk = self._file_obj.read(size)
@@ -163,23 +166,28 @@ class ProgressFile:
 
     def _render(self) -> None:
         percent = min(int(self._uploaded * 100 / self._total_size), 100)
-        if percent == self._last_percent and self._uploaded != self._total_size:
+        if percent == self._last_percent:
             return
         self._last_percent = percent
         uploaded_mb = self._uploaded / (1024 * 1024)
         total_mb = self._total_size / (1024 * 1024)
-        sys.stdout.write(f"\rUploading {self._label}: {percent:3d}% ({uploaded_mb:.1f}/{total_mb:.1f} MiB)")
+        message = f"{percent:3d}% ({uploaded_mb:.1f}/{total_mb:.1f} MiB)"
+        sys.stdout.write(f"\r{format_log_line('INFO', self._label, 'upload', message)}")
         sys.stdout.flush()
+        self._line_open = True
 
     def finish(self) -> None:
         self._uploaded = self._total_size
         self._render()
         sys.stdout.write("\n")
         sys.stdout.flush()
+        self._line_open = False
 
     def close_line(self) -> None:
-        sys.stdout.write("\n")
-        sys.stdout.flush()
+        if self._line_open:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+            self._line_open = False
 
     def __getattr__(self, name: str):
         return getattr(self._file_obj, name)
@@ -248,7 +256,7 @@ def parse_args() -> argparse.Namespace:
         "--verbose",
         action=argparse.BooleanOptionalAction,
         default=DEFAULT_VERBOSE,
-        help="Print detailed detection, extraction, and cleanup output. Defaults to true; use --no-verbose to disable.",
+        help="Print detailed detection, HTTP request, upload result, and cleanup output. Defaults to false.",
     )
     return parser.parse_args()
 
@@ -830,17 +838,50 @@ def get_file_hash(file_path: Path) -> str:
     return digest.hexdigest()
 
 
+def request_target(url: str) -> str:
+    parsed = urlsplit(url)
+    return parsed.path or "/"
+
+
+def hash_check_url(api_url: str) -> str:
+    parsed = urlsplit(api_url)
+    return urlunsplit(parsed._replace(path=f"{parsed.path.rstrip('/')}/hash-check"))
+
+
+def log_request(
+    method: str,
+    url: str,
+    explanation: str,
+    *,
+    verbose: bool,
+    level: str = "INFO",
+) -> None:
+    log_event(
+        level,
+        "request",
+        f"{method.upper()} {request_target(url)}",
+        explanation,
+        verbose=verbose,
+    )
+
+
+def warn_hash_check_prevented_upload(file_path: Path) -> None:
+    log_event(
+        "WARNING",
+        file_path.name,
+        "upload",
+        "file will not be uploaded because the hash check did not pass",
+    )
+
+
 def is_track_already_published(api_url: str, api_key: str, file_path: Path, *, verbose: bool) -> bool:
     file_hash = get_file_hash(file_path)
-    check_url = f"{api_url.rstrip('/')}/hash-check"
+    check_url = hash_check_url(api_url)
     request_payload = {
         "file_hash": file_hash,
         "file_hash_algorithm": "blake3-256",
     }
-    log(
-        f"Hash check request to {check_url}:\n{json.dumps(request_payload, indent=2)}",
-        verbose=verbose,
-    )
+    log_request("POST", check_url, "sending request", verbose=verbose)
     try:
         response = httpx.post(
             check_url,
@@ -848,25 +889,30 @@ def is_track_already_published(api_url: str, api_key: str, file_path: Path, *, v
             json=request_payload,
             timeout=60.0,
         )
-        log(
-            f"Hash check response ({response.status_code}):\n{response.text}",
-            verbose=verbose,
-        )
         response.raise_for_status()
+        log_request("POST", check_url, f"response {response.status_code}", verbose=verbose)
     except httpx.HTTPStatusError as exc:
+        log_request(
+            "POST", check_url, f"exception: HTTP {exc.response.status_code}",
+            verbose=True, level="ERROR",
+        )
+        warn_hash_check_prevented_upload(file_path)
         raise UploaderError(
-            f"Hash check failed for {file_path.name}: "
-            f"HTTP {exc.response.status_code} {exc.response.text}"
+            f"Hash check failed for {file_path.name}: HTTP {exc.response.status_code}"
         ) from exc
     except httpx.HTTPError as exc:
+        log_request("POST", check_url, f"exception: {exc}", verbose=True, level="ERROR")
+        warn_hash_check_prevented_upload(file_path)
         raise UploaderError(f"Hash check failed for {file_path.name}: {exc}") from exc
 
     try:
         payload = response.json()
     except json.JSONDecodeError as exc:
+        warn_hash_check_prevented_upload(file_path)
         raise UploaderError(f"Hash check response was not valid JSON for {file_path.name}") from exc
 
     if not isinstance(payload, dict) or not isinstance(payload.get("exists"), bool):
+        warn_hash_check_prevented_upload(file_path)
         raise UploaderError(f"Hash check response did not contain a boolean 'exists' value for {file_path.name}")
     return payload["exists"]
 
@@ -876,12 +922,15 @@ def upload_prepared_track(
     api_key: str,
     prepared_track: PreparedTrack,
     visibility: str,
+    *,
+    verbose: bool,
 ) -> dict:
     if not prepared_track.output_path.is_file():
         raise UploaderError(f"Cannot upload missing extracted file: {prepared_track.output_path}")
 
     file_size = prepared_track.output_path.stat().st_size
     progress_file: ProgressFile | None = None
+    log_request("POST", api_url, "sending request", verbose=verbose)
     try:
         with prepared_track.output_path.open("rb") as media_file:
             progress_file = ProgressFile(media_file, file_size, prepared_track.output_path.name)
@@ -899,16 +948,21 @@ def upload_prepared_track(
             )
             progress_file.finish()
             response.raise_for_status()
+            log_request("POST", api_url, f"response {response.status_code}", verbose=verbose)
     except httpx.HTTPStatusError as exc:
         if progress_file is not None:
             progress_file.close_line()
+        log_request(
+            "POST", api_url, f"exception: HTTP {exc.response.status_code}",
+            verbose=True, level="ERROR",
+        )
         raise UploaderError(
-            f"Upload failed for {prepared_track.output_path.name}: "
-            f"HTTP {exc.response.status_code} {exc.response.text}"
+            f"Upload failed for {prepared_track.output_path.name}: HTTP {exc.response.status_code}"
         ) from exc
     except httpx.HTTPError as exc:
         if progress_file is not None:
             progress_file.close_line()
+        log_request("POST", api_url, f"exception: {exc}", verbose=True, level="ERROR")
         raise UploaderError(f"Upload failed for {prepared_track.output_path.name}: {exc}") from exc
 
     try:
@@ -932,14 +986,41 @@ def format_table(headers: list[str], rows: list[list[object]]) -> str:
     return "\n".join([separator, header_line, separator, *body_lines, separator])
 
 
-def log(message: str, *, verbose: bool) -> None:
+def clean_log_field(value: object) -> str:
+    return " ".join(str(value).replace("|", "/").splitlines())
+
+
+def format_log_line(level: str, target: str, action: str, explanation: str) -> str:
+    timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
+    return (
+        f"{timestamp} | {clean_log_field(level).upper()} | {clean_log_field(target)} | "
+        f"{clean_log_field(action)} | {clean_log_field(explanation)}"
+    )
+
+
+def log_event(
+    level: str,
+    target: str,
+    action: str,
+    explanation: str,
+    *,
+    verbose: bool = True,
+) -> None:
     if verbose:
-        print(message)
+        print(format_log_line(level, target, action, explanation))
 
 
-def log_table(title: str, headers: list[str], rows: list[list[object]], *, verbose: bool) -> None:
+def log_table(
+    title: str,
+    headers: list[str],
+    rows: list[list[object]],
+    *,
+    verbose: bool = True,
+    target: str = "summary",
+    action: str = "report",
+) -> None:
     if verbose and rows:
-        print(title)
+        log_event("INFO", target, action, title)
         print(format_table(headers, rows))
 
 
@@ -967,9 +1048,7 @@ def main() -> int:
 
     args = parse_args()
     input_path = Path(args.input).expanduser().resolve()
-    output_dir = (
-        Path(args.output_dir).expanduser().resolve()
-    )
+    output_dir = Path(args.output_dir).expanduser().resolve()
     target_languages_by_type = {
         "audio": parse_language_filters(args.audio_languages, DEFAULT_AUDIO_LANGUAGES),
         "subtitles": parse_subtitle_language_filters(args.subtitle_languages),
@@ -1003,19 +1082,27 @@ def main() -> int:
             + f" files found at: {input_path}"
         )
 
-    log(f"Uploading tracks to {args.api_url}", verbose=args.verbose)
-    print(f"Found {len(mkv_files)} MKV file(s) and {len(standalone_files)} standalone file(s).")
+    log_event(
+        "INFO",
+        "input",
+        "detect",
+        f"found {len(mkv_files)} MKV file(s) and {len(standalone_files)} standalone file(s)",
+    )
     log_table(
         "Detected MKV files:",
-        ["#", "file", "path"],
-        [[index, file_path.name, file_path] for index, file_path in enumerate(mkv_files, start=1)],
+        ["full path"],
+        [[file_path] for file_path in mkv_files],
         verbose=args.verbose,
+        target="MKV files",
+        action="detect",
     )
     log_table(
         "Detected standalone files:",
-        ["#", "file", "path"],
-        [[index, file_path.name, file_path] for index, file_path in enumerate(standalone_files, start=1)],
+        ["full path"],
+        [[file_path] for file_path in standalone_files],
         verbose=args.verbose,
+        target="standalone files",
+        action="detect",
     )
 
     extracted_count = 0
@@ -1024,7 +1111,7 @@ def main() -> int:
     failed_files: list[tuple[Path, str]] = []
     for file_path in mkv_files:
         try:
-            log(f"Inspecting {file_path}", verbose=args.verbose)
+            log_event("INFO", file_path.name, "inspect", str(file_path), verbose=args.verbose)
             prepared_tracks = build_prepared_tracks(file_path, output_dir, target_languages_by_type)
             if not prepared_tracks:
                 subtitle_filter_label = (
@@ -1032,12 +1119,18 @@ def main() -> int:
                     if target_languages_by_type["subtitles"] == [ALL_SUBTITLE_LANGUAGES]
                     else ", ".join(target_languages_by_type["subtitles"])
                 )
-                print(
-                    f"Skipping {file_path.name}: no matching audio tracks for {', '.join(target_languages_by_type['audio'])} "
-                    f"or subtitle tracks for {subtitle_filter_label} found."
+                log_event(
+                    "WARNING",
+                    file_path.name,
+                    "extract",
+                    f"skipped: no matching audio tracks for {', '.join(target_languages_by_type['audio'])} "
+                    f"or subtitle tracks for {subtitle_filter_label} found",
                 )
                 continue
-            print(f"Extracting {len(prepared_tracks)} track(s) from {file_path.name}...")
+            log_event(
+                "INFO", file_path.name, "extract",
+                f"extracting {len(prepared_tracks)} track(s)",
+            )
             extract_tracks(file_path, prepared_tracks)
             extracted_count += len(prepared_tracks)
             log_table(
@@ -1052,7 +1145,8 @@ def main() -> int:
                     ]
                     for prepared_track in prepared_tracks
                 ],
-                verbose=args.verbose,
+                target=file_path.name,
+                action="extract",
             )
             for prepared_track in prepared_tracks:
                 if is_track_already_published(
@@ -1062,32 +1156,46 @@ def main() -> int:
                     verbose=args.verbose,
                 ):
                     skipped_count += 1
-                    print(f"Track {prepared_track.output_path.name} already published; skipping upload.")
+                    log_event(
+                        "WARNING", prepared_track.output_path.name, "upload",
+                        "file will not be uploaded because the hash check reports it is already published",
+                    )
                     if not args.keep_extracted and prepared_track.cleanup_after_upload:
                         remove_extracted_file(prepared_track)
-                        log(f"Removed extracted file {prepared_track.output_path}", verbose=args.verbose)
+                        log_event(
+                            "INFO", prepared_track.output_path.name, "cleanup",
+                            f"removed {prepared_track.output_path}", verbose=args.verbose,
+                        )
                     continue
                 upload_response = upload_prepared_track(
                     args.api_url,
                     args.api_key,
                     prepared_track,
                     args.visibility,
+                    verbose=args.verbose,
                 )
                 uploaded_count += 1
-                print(f"Uploaded {prepared_track.output_path.name} as {args.visibility} track {upload_response.get('id')}")
+                log_event(
+                    "INFO", prepared_track.output_path.name, "upload",
+                    f"uploaded as {args.visibility} track {upload_response.get('id')}",
+                    verbose=args.verbose,
+                )
                 if not args.keep_extracted and prepared_track.cleanup_after_upload:
                     remove_extracted_file(prepared_track)
-                    log(f"Removed extracted file {prepared_track.output_path}", verbose=args.verbose)
+                    log_event(
+                        "INFO", prepared_track.output_path.name, "cleanup",
+                        f"removed {prepared_track.output_path}", verbose=args.verbose,
+                    )
         except (UploaderError, subprocess.CalledProcessError, OSError, ValueError) as exc:
             failed_files.append((file_path, str(exc)))
-            print(f"ERROR: skipping {file_path.name}: {exc}")
+            log_event("ERROR", file_path.name, "process", f"skipped: {exc}")
             continue
 
     standalone_uploaded_count = 0
     standalone_skipped_count = 0
     for file_path in standalone_files:
         try:
-            log(f"Inspecting standalone {file_path}", verbose=args.verbose)
+            log_event("INFO", file_path.name, "inspect", str(file_path), verbose=args.verbose)
             prepared_track = build_standalone_track(file_path, target_languages_by_type)
             if is_track_already_published(
                 args.api_url,
@@ -1097,43 +1205,56 @@ def main() -> int:
             ):
                 skipped_count += 1
                 standalone_skipped_count += 1
-                print(f"Track {file_path.name} already published; skipping upload.")
+                log_event(
+                    "WARNING", file_path.name, "upload",
+                    "file will not be uploaded because the hash check reports it is already published",
+                )
                 continue
-            print(
-                f"Uploading standalone {prepared_track.track_type} "
-                f"{file_path.name} (language={prepared_track.language})..."
+            log_event(
+                "INFO", file_path.name, "upload",
+                f"uploading standalone {prepared_track.track_type}; language={prepared_track.language}",
+                verbose=args.verbose,
             )
             upload_response = upload_prepared_track(
                 args.api_url,
                 args.api_key,
                 prepared_track,
                 args.visibility,
+                verbose=args.verbose,
             )
             uploaded_count += 1
             standalone_uploaded_count += 1
-            print(f"Uploaded {file_path.name} as {args.visibility} track {upload_response.get('id')}")
+            log_event(
+                "INFO", file_path.name, "upload",
+                f"uploaded as {args.visibility} track {upload_response.get('id')}",
+                verbose=args.verbose,
+            )
         except StandaloneSkip as skip:
             standalone_skipped_count += 1
-            print(f"Skipping standalone {file_path.name}: {skip}")
+            log_event("WARNING", file_path.name, "upload", f"standalone file will not be uploaded: {skip}")
             continue
         except (UploaderError, subprocess.CalledProcessError, OSError, ValueError) as exc:
             failed_files.append((file_path, str(exc)))
-            print(f"ERROR: skipping {file_path.name}: {exc}")
+            log_event("ERROR", file_path.name, "process", f"skipped: {exc}")
             continue
 
-    print(
-        f"Prepared {extracted_count} extracted track file(s). "
-        f"Uploaded {uploaded_count} {args.visibility} track(s) "
-        f"({standalone_uploaded_count} standalone, {standalone_skipped_count} standalone skipped). "
-        f"Skipped {skipped_count} already published track(s)."
+    log_event(
+        "INFO", "run", "summary",
+        f"prepared {extracted_count} extracted track file(s); "
+        f"uploaded {uploaded_count} {args.visibility} track(s) "
+        f"({standalone_uploaded_count} standalone, {standalone_skipped_count} standalone skipped); "
+        f"skipped {skipped_count} already published track(s)",
+        verbose=args.verbose,
     )
     if failed_files:
-        print(f"Encountered errors on {len(failed_files)} file(s):")
-        for file_path, message in failed_files:
-            print(f"  - {file_path.name}: {message}")
+        log_event("ERROR", "run", "summary", f"encountered errors on {len(failed_files)} file(s)")
         return 1
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except (UploaderError, subprocess.CalledProcessError, OSError, ValueError) as exc:
+        log_event("ERROR", "run", "startup", str(exc))
+        raise SystemExit(1) from exc

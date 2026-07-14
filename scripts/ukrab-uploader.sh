@@ -1,8 +1,8 @@
 #!/usr/bin/env sh
 
-# A small Docker wrapper for macOS and Linux. It deliberately exposes only the
-# required values a user needs to provide; all extraction options use the
-# image's defaults.
+# A small Docker wrapper for macOS and Linux. It exposes the required values,
+# upload visibility, and output verbosity; extraction options use the image's
+# defaults.
 
 set -eu
 
@@ -12,8 +12,8 @@ API_URL="https://ukrab.work/api/uploader"
 usage() {
     cat <<'EOF'
 Usage:
-  ukrab-uploader.sh API_KEY PATH [public|draft]
-  ukrab-uploader.sh --api-key API_KEY --input PATH [--visibility public|draft]
+  ukrab-uploader.sh API_KEY PATH [public|draft] [--verbose|--no-verbose]
+  ukrab-uploader.sh --api-key API_KEY --input PATH [--visibility public|draft] [--verbose|--no-verbose]
 
 Required values:
   API_KEY            Your Audio Bucket API key.
@@ -24,9 +24,11 @@ Optional options:
   --api-key API_KEY  Named alternative for API_KEY.
   --input PATH       Named alternative for PATH.
   --visibility VALUE Named alternative for public|draft.
+  --verbose          Enable detailed uploader output.
+  --no-verbose       Use concise uploader output (the default).
 
 All other uploader settings use their defaults: Ukrainian audio, all subtitle
-languages, temporary extracted files, and verbose output.
+languages, temporary extracted files, and concise output.
 EOF
 }
 
@@ -40,6 +42,7 @@ api_key=""
 input_path=""
 visibility="public"
 visibility_set=0
+verbosity_flag=""
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -58,6 +61,10 @@ while [ "$#" -gt 0 ]; do
             visibility=$2
             visibility_set=1
             shift 2
+            ;;
+        --verbose|--no-verbose)
+            verbosity_flag=$1
+            shift
             ;;
         --help|-h)
             usage
@@ -113,10 +120,16 @@ docker pull "$IMAGE"
 
 printf '%s\n' "Starting Audio Bucket uploader..."
 
-exec docker run --rm \
+set -- docker run --rm \
     --volume "$host_input:/input:ro" \
     "$IMAGE" \
     --api-key "$api_key" \
     --api-url "$API_URL" \
     --input "$container_input" \
     --visibility "$visibility"
+
+if [ -n "$verbosity_flag" ]; then
+    set -- "$@" "$verbosity_flag"
+fi
+
+exec "$@"

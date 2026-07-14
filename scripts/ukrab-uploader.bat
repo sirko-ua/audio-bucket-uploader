@@ -1,8 +1,8 @@
 @echo off
 setlocal EnableExtensions DisableDelayedExpansion
 
-rem A small Docker wrapper for Windows. It exposes only the required values;
-rem all extraction options use the image's defaults.
+rem A small Docker wrapper for Windows. It exposes the required values, upload
+rem visibility, and output verbosity; extraction options use the image's defaults.
 
 set "IMAGE=ghcr.io/sirko-ua/audio-bucket-uploader:latest"
 set "API_URL=https://ukrab.work/api/uploader"
@@ -10,6 +10,7 @@ set "api_key="
 set "input_path="
 set "visibility=public"
 set "visibility_set=0"
+set "verbosity_flag="
 
 :parse_args
 if "%~1"=="" goto validate_args
@@ -44,6 +45,18 @@ if /I "%~1"=="--visibility" (
     set "visibility=%~2"
     set "visibility_set=1"
     shift
+    shift
+    goto parse_args
+)
+
+if /I "%~1"=="--verbose" (
+    set "verbosity_flag=--verbose"
+    shift
+    goto parse_args
+)
+
+if /I "%~1"=="--no-verbose" (
+    set "verbosity_flag=--no-verbose"
     shift
     goto parse_args
 )
@@ -121,13 +134,13 @@ docker pull "%IMAGE%"
 if errorlevel 1 exit /b %errorlevel%
 
 echo Starting Audio Bucket uploader...
-docker run --rm --volume "%host_input%:/input:ro" "%IMAGE%" --api-key "%api_key%" --api-url "%API_URL%" --input "%container_input%" --visibility "%visibility%"
+docker run --rm --volume "%host_input%:/input:ro" "%IMAGE%" --api-key "%api_key%" --api-url "%API_URL%" --input "%container_input%" --visibility "%visibility%" %verbosity_flag%
 exit /b %errorlevel%
 
 :usage
 echo Usage:
-echo   ukrab-uploader.bat API_KEY PATH [public^|draft]
-echo   ukrab-uploader.bat --api-key API_KEY --input PATH [--visibility public^|draft]
+echo   ukrab-uploader.bat API_KEY PATH [public^|draft] [--verbose^|--no-verbose]
+echo   ukrab-uploader.bat --api-key API_KEY --input PATH [--visibility public^|draft] [--verbose^|--no-verbose]
 echo.
 echo Required values:
 echo   API_KEY            Your Audio Bucket API key.
@@ -138,9 +151,11 @@ echo   public^|draft       Upload visibility. Defaults to public.
 echo   --api-key API_KEY  Named alternative for API_KEY.
 echo   --input PATH       Named alternative for PATH.
 echo   --visibility VALUE Named alternative for public^|draft.
+echo   --verbose          Enable detailed uploader output.
+echo   --no-verbose       Use concise uploader output (the default).
 echo.
 echo All other uploader settings use their defaults: Ukrainian audio, all subtitle
-echo languages, temporary extracted files, and verbose output.
+echo languages, temporary extracted files, and concise output.
 exit /b 0
 
 :fail

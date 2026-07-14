@@ -120,8 +120,25 @@ docker pull "$IMAGE"
 
 printf '%s\n' "Starting Audio Bucket uploader..."
 
+# Persist the run history and failure log next to the media, so a restarted run
+# resumes instead of re-extracting and re-hash-checking everything.
+#
+# One state dir per library, always: inside the container every library is
+# mounted at /input, so the history keys (/input/Film.mkv) collide across
+# libraries. Sharing one state dir would let a mirrored library — same relative
+# path, same size, same mtime, all preserved by rsync/cp -p — be skipped as
+# "already done" and never reach the server. Hence the home fallback (for
+# read-only media) is still named after the library.
+state_dir="$host_input/.audio-bucket-uploader"
+if ! mkdir -p "$state_dir" 2>/dev/null; then
+    library_id=$(printf '%s' "$host_input" | tr -c '[:alnum:]' '_')
+    state_dir="${HOME:-/tmp}/.audio-bucket-uploader/$library_id"
+    mkdir -p "$state_dir"
+fi
+
 set -- docker run --rm \
     --volume "$host_input:/input:ro" \
+    --volume "$state_dir:/state" \
     "$IMAGE" \
     --api-key "$api_key" \
     --api-url "$API_URL" \

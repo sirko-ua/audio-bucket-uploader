@@ -127,35 +127,25 @@ SERVER_DOWN_EXIT_CODE = 3
 HTTP_ATTEMPTS = 5
 HTTP_RETRY_BASE_DELAY = 2.0
 HTTP_RETRY_MAX_DELAY = 60.0
-# An unauthenticated key is never one file's answer: nothing will ever succeed,
-# so stop instead of walking the whole library and marking every file failed.
-# (The hash check runs first and carries the same key, so this costs no upload.)
+# A bad key is never one file's answer: nothing will ever succeed, so stop
+# instead of marking every file failed.
 FATAL_HTTP_STATUSES = {401}
-# These only prove a misconfigured URL or key while nothing has worked yet. Once
-# a request has succeeded they are this file's answer ("no release for this
-# unique_id", "not your release") — a normal answer that must never stop the run.
-# Stopping on them would also stall every restart on the same file, re-pushing
-# its body forever, because a stopped run records no failure for it.
+# Only fatal before the first success, where they prove a misconfigured URL or
+# key. After a success they are this file's answer ("no release for this
+# unique_id") — a normal 4xx that must not stop the run.
 FATAL_BEFORE_FIRST_SUCCESS_STATUSES = {403, 404}
-# Consecutive requests to one endpoint that exhausted their retries with a
-# server-side error before we call the server down.
 MAX_CONSECUTIVE_SERVER_ERRORS = 3
 
-# Standalone (loose) media files that are uploaded directly rather than
-# extracted from an MKV container. Extensions are matched case-insensitively.
 STANDALONE_AUDIO_EXTENSIONS = {
     "wav", "mp3", "aac", "flac", "ogg", "m4a", "opus",
     "ac3", "eac3", "ac4", "dts", "dtshd", "truehd", "mlp", "thd",
 }
 STANDALONE_SUBTITLE_EXTENSIONS = {"ass", "srt", "pgs", "sup"}
 
-# Video container extensions whose MediaInfo can supply the source video's
-# unique_id that the uploader endpoint requires for a standalone track.
 VIDEO_CONTAINER_EXTENSIONS = {
     ".mkv", ".mp4", ".m4v", ".webm", ".avi", ".mov", ".ts", ".m2ts", ".mpg", ".mpeg",
 }
 
-# token (already normalized) -> canonical language, built from LANGUAGE_ALIASES.
 LANGUAGE_TOKEN_LOOKUP: dict[str, str] = {}
 for _canonical, _aliases in LANGUAGE_ALIASES.items():
     LANGUAGE_TOKEN_LOOKUP[_canonical] = _canonical
@@ -944,8 +934,6 @@ def build_standalone_track(
     detected_language = detect_standalone_language(own_media_info_track, file_path)
     target_languages = target_languages_by_type[track_type]
 
-    # The endpoint requires a parseable track language, so a file whose language
-    # cannot be determined (from MediaInfo or its name) cannot be uploaded.
     if not detected_language:
         raise StandaloneSkip(
             "could not determine a track language (required by the uploader endpoint); "
@@ -1330,10 +1318,6 @@ def upload_prepared_track(
             return response
 
     def already_published() -> bool:
-        # An attempt may have reached the server even though its answer did not
-        # reach us: a read timeout, a dropped connection, or a 502/504 from a
-        # proxy in front of a backend that already stored the file. Ask before
-        # re-sending, or the track gets published twice.
         return is_track_already_published(
             api_url, api_key, prepared_track.output_path, verbose=verbose, file_hash=file_hash
         )
@@ -1356,8 +1340,8 @@ def get_default_state_dir() -> Path:
 
 
 def remove_extracted_file(prepared_track: PreparedTrack, *, verbose: bool = False) -> None:
-    """Delete an extracted file. Never fatal: a leftover temp file must not sink
-    a track that already uploaded successfully."""
+    """Never fatal: a leftover temp file must not sink a track that already
+    uploaded successfully."""
     if not prepared_track.cleanup_after_upload:
         return
     try:
@@ -1381,11 +1365,13 @@ def track_item(prepared_track: PreparedTrack) -> str:
 
 
 def safe_fingerprint(file_path: Path) -> str:
+    """Fingerprint that never raises. A file whose stat() fails (a dangling
+    symlink, an unmounted disk) must still reach the history check, or it can
+    never be given up on and is retried on every run forever. The empty string
+    never matches a stored fingerprint, so the entry is reconsidered next run."""
     try:
         return file_fingerprint(file_path)
     except OSError:
-        # The file vanished mid-run; an empty fingerprint never matches, so the
-        # entry is simply reconsidered next time.
         return ""
 
 
@@ -1466,7 +1452,6 @@ def process_track(
             remove_extracted_file(prepared_track, verbose=args.verbose)
         return True
     except AlreadyPublished:
-        # The upload landed; only its answer was lost. Do not send it again.
         history.mark(source_path, item, fingerprint, "duplicate", "answer lost, hash check confirmed it landed")
         stats.duplicates += 1
         log_event("WARNING", name, "upload", "the answer was lost, but the track did reach the server")
@@ -1490,9 +1475,6 @@ def process_container(
     output_dir: Path,
     target_languages_by_type: dict[str, list[str]],
 ) -> None:
-    # safe_fingerprint, not file_fingerprint: a file whose stat() fails (a
-    # dangling symlink, a disk that unmounted) must still reach the history
-    # check, or it can never be given up on and is retried on every run forever.
     fingerprint = safe_fingerprint(file_path)
     if skipped_by_history(history, stats, file_path, fingerprint, FILE_ITEM, verbose=args.verbose):
         return
@@ -1587,9 +1569,6 @@ def process_standalone(
     file_path: Path,
     target_languages_by_type: dict[str, list[str]],
 ) -> None:
-    # safe_fingerprint, not file_fingerprint: a file whose stat() fails (a
-    # dangling symlink, a disk that unmounted) must still reach the history
-    # check, or it can never be given up on and is retried on every run forever.
     fingerprint = safe_fingerprint(file_path)
     if skipped_by_history(history, stats, file_path, fingerprint, FILE_ITEM, verbose=args.verbose):
         return
@@ -1792,8 +1771,6 @@ def main() -> int:
     history.close()
 
     if stopped:
-        # Not 2: argparse already exits 2 for a usage error, and a supervisor
-        # that retries "server down" must not retry a typo in the flags forever.
         return SERVER_DOWN_EXIT_CODE
     return 1 if stats.failed or stats.given_up else 0
 

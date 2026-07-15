@@ -34,12 +34,12 @@ DATABASE_NAME = "history.sqlite3"
 # item key of the row that stands for the whole source file
 FILE_ITEM = "*"
 
-# an item that needs no work, and why
 FINAL = "final"
 GIVEN_UP = "given_up"
 
 FINAL_STATUSES = {"uploaded", "duplicate", "skipped", "done"}
-# statuses that only hold while the language filters stay the same
+# skipped/done depend on which languages were requested; an uploaded or duplicate
+# track is on the server regardless, so only these expire on a filter change.
 FILTER_DEPENDENT_STATUSES = {"skipped", "done"}
 
 SCHEMA = """
@@ -205,7 +205,6 @@ class History:
     def record_failure(
         self, path: Path, item: str, fingerprint: str, stage: str, error: str
     ) -> None:
-        """Mark the item failed and append a reviewable line to failures.jsonl."""
         self.mark(path, item, fingerprint, "failed", error)
         record = {
             "time": _now(),

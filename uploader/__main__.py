@@ -278,6 +278,53 @@ def run_text_command(command: list[str]) -> str:
     return completed.stdout
 
 
+def sanitize_media_info_paths(
+    media_info_payload: dict,
+    media_info_text: str,
+    file_path: Path,
+) -> tuple[dict, str]:
+    """Replace local paths in MediaInfo output with the source filename."""
+    filename = file_path.name
+
+    def sanitize_json(value):
+        if isinstance(value, dict):
+            for key in list(value):
+                normalized_key = re.sub(r"[ _]", "", str(key)).lower()
+                if normalized_key == "foldername":
+                    # This has no value to the uploader and can expose the
+                    # user's directory after CompleteName is sanitized.
+                    value.pop(key)
+                elif normalized_key == "completename" or key == "@ref":
+                    value[key] = filename
+                else:
+                    value[key] = sanitize_json(value[key])
+        elif isinstance(value, list):
+            for index, item in enumerate(value):
+                value[index] = sanitize_json(item)
+        return value
+
+    sanitize_json(media_info_payload)
+
+    # MediaInfo's text format labels this field "Complete name". Replace the
+    # whole value as well as exact path occurrences, covering localized or
+    # version-specific output without changing unrelated metadata.
+    media_info_text = re.sub(
+        r"(?mi)^([ \t]*Complete name[ \t]*:[ \t]*).*$",
+        lambda match: f"{match.group(1)}{filename}",
+        media_info_text,
+    )
+    path_candidates = {str(file_path)}
+    try:
+        path_candidates.add(str(file_path.resolve()))
+    except OSError:
+        pass
+    for path in sorted(path_candidates, key=len, reverse=True):
+        if path and path != filename:
+            media_info_text = media_info_text.replace(path, filename)
+
+    return media_info_payload, media_info_text
+
+
 def run_command(command: list[str]) -> None:
     subprocess.run(command, check=True)
 
@@ -465,6 +512,9 @@ def media_info_has_unique_id(media_info_payload: dict) -> bool:
 def collect_media_info(file_path: Path) -> tuple[dict[str, list[dict]], dict, str, dict]:
     media_info_payload = run_json_command(["mediainfo", "--Output=JSON", str(file_path)])
     media_info_text = run_text_command(["mediainfo", str(file_path)])
+    media_info_payload, media_info_text = sanitize_media_info_paths(
+        media_info_payload, media_info_text, file_path
+    )
     mkvmerge_payload = run_json_command(["mkvmerge", "-J", str(file_path)])
 
     tracks_by_type: dict[str, list[dict]] = {"video": [], "audio": [], "text": []}
@@ -622,6 +672,9 @@ def detect_standalone_language(media_info_track: dict | None, file_path: Path) -
 def collect_standalone_media_info(file_path: Path) -> tuple[dict, str, dict[str, list[dict]]]:
     media_info_payload = run_json_command(["mediainfo", "--Output=JSON", str(file_path)])
     media_info_text = run_text_command(["mediainfo", str(file_path)])
+    media_info_payload, media_info_text = sanitize_media_info_paths(
+        media_info_payload, media_info_text, file_path
+    )
     tracks_by_type: dict[str, list[dict]] = {"video": [], "audio": [], "text": []}
     for track in media_info_payload.get("media", {}).get("track", []):
         track_type = str(track.get("@type", "")).lower()

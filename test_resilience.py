@@ -214,13 +214,18 @@ with tempfile.TemporaryDirectory() as temp:
     # be about that file (a proxy resetting one oversized body looks identical),
     # so it takes a few in a row before we call the server down.
     reset_http_state()
-    for _ in range(app.MAX_CONSECUTIVE_SERVER_ERRORS - 1):
+    for _ in range(app.MAX_CONSECUTIVE_UNREACHABLE - 1):
         unreachable = responder(*[httpx.ConnectError("refused")] * app.HTTP_ATTEMPTS)
         raises(app.UploaderError, lambda: send(unreachable))
         assert not unreachable.remaining, "every attempt must be used"
     raises(app.ServerDown, lambda: send(
         responder(*[httpx.ConnectError("refused")] * app.HTTP_ATTEMPTS)
     ))
+
+    # A 5xx proves the server is answering, so a folder of payloads it chokes on
+    # is not an outage: it takes far more of them in a row to stop the run than
+    # it takes answers that never arrive at all.
+    assert app.MAX_CONSECUTIVE_SERVER_ERRORS > app.MAX_CONSECUTIVE_UNREACHABLE
 
     # 5xx is per-file at first; the run stops once one endpoint fails repeatedly.
     reset_http_state()
@@ -322,7 +327,7 @@ with tempfile.TemporaryDirectory() as temp:
     # and stopping on the first one would halt a healthy server — and, since a
     # stopped run records no failure, replay that same file on every restart.
     reset_http_state()
-    for _ in range(app.MAX_CONSECUTIVE_SERVER_ERRORS - 1):
+    for _ in range(app.MAX_CONSECUTIVE_UNREACHABLE - 1):
         raises(app.UploaderError, lambda: send(
             responder(*[httpx.ReadError("connection reset")] * app.HTTP_ATTEMPTS),
             already_done=lambda: False,
@@ -401,6 +406,54 @@ with tempfile.TemporaryDirectory() as temp:
         root / "movie.mkv", {"errors": ["Could not open the file"]}
     ))
     app.check_container_readable(root / "movie.mkv", {"container": {"recognized": True, "supported": True}})
+
+    # A storage blip (spun-down disk, NAS reconnect, a file still being written)
+    # must not burn one of MAX_ATTEMPTS: the probe is retried before giving up.
+    attempts = []
+
+    def flaky_probe():
+        attempts.append(1)
+        if len(attempts) < 3:
+            raise app.UploaderError("could not be opened for reading")
+        return "payload"
+
+    assert app.retry_probe("movie.mkv", flaky_probe) == "payload"
+    assert len(attempts) == 3, attempts
+    raises(app.UploaderError, lambda: app.retry_probe(
+        "movie.mkv", lambda: (_ for _ in ()).throw(app.UploaderError("damaged"))
+    ))
+
+    # A missing tool cannot fix itself: retrying it would add a wait to every
+    # file in the library.
+    tool_probes = []
+    raises(app.MissingTool, lambda: app.retry_probe("movie.mkv", lambda: (
+        tool_probes.append(1), (_ for _ in ()).throw(app.MissingTool("no mediainfo"))
+    )))
+    assert len(tool_probes) == 1, tool_probes
+
+    # A variable-frame-rate video carries no FrameRate in its headers, and the
+    # endpoint rejects the whole file without one. A full parse computes it.
+    VFR = {"media": {"track": [{"@type": "Video", "FrameRate_Mode": "VFR"}]}}
+    DEEP = {"media": {"track": [{"@type": "Video", "FrameRate": "25.875"}]}}
+    assert not app.has_video_frame_rate(VFR)
+    assert app.has_video_frame_rate(DEEP)
+
+    app.run_json_command = lambda command, timeout=None: DEEP
+    app.run_text_command = lambda command, timeout=None: "deep text"
+    assert app.add_missing_video_frame_rate(root / "m.mkv", VFR, "text") == (DEEP, "deep text")
+    # Already has one: no full parse at all (it would read the whole file).
+    app.run_json_command = lambda command, timeout=None: (_ for _ in ()).throw(
+        AssertionError("must not reparse a file that already reports a frame rate")
+    )
+    assert app.add_missing_video_frame_rate(root / "m.mkv", DEEP, "text") == (DEEP, "text")
+    # A full parse that still finds nothing must not fail the file.
+    app.run_json_command = lambda command, timeout=None: VFR
+    app.run_text_command = lambda command, timeout=None: "still nothing"
+    assert app.add_missing_video_frame_rate(root / "m.mkv", VFR, "text") == (VFR, "text")
+    app.run_json_command = lambda command, timeout=None: (_ for _ in ()).throw(
+        app.UploaderError("mediainfo timed out")
+    )
+    assert app.add_missing_video_frame_rate(root / "m.mkv", VFR, "text") == (VFR, "text")
 
     for open_entry in OPEN_HISTORIES:
         open_entry.close()

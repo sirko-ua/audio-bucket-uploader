@@ -116,6 +116,15 @@ DEFAULT_STANDALONE = True
 # mediainfo/mkvmerge only read headers, so they are quick; a probe that runs
 # this long is hung on a broken file and must not stall the whole run.
 PROBE_TIMEOUT = 300.0
+# A full parse reads every frame, so it is bounded separately: it only ever runs
+# as the VFR fallback below, and a slow scan there must not look like a hang.
+DEEP_PROBE_TIMEOUT = 900.0
+# A spun-down disk, a NAS reconnect, or a file sonarr is still writing makes a
+# perfectly good container fail one probe and pass the next. Without a retry that
+# blip burns one of MAX_ATTEMPTS, and three unlucky runs give up on the file for
+# good.
+PROBE_ATTEMPTS = 3
+PROBE_RETRY_DELAY = 5.0
 # ponytail: one hour per mkvextract call. Raise it if a legitimate extraction of
 # a very large track on very slow storage ever trips it.
 EXTRACT_TIMEOUT = 3600.0
@@ -134,7 +143,14 @@ FATAL_HTTP_STATUSES = {401}
 # key. After a success they are this file's answer ("no release for this
 # unique_id") — a normal 4xx that must not stop the run.
 FATAL_BEFORE_FIRST_SUCCESS_STATUSES = {403, 404}
-MAX_CONSECUTIVE_SERVER_ERRORS = 3
+# A connection that never gets an answer means the host is gone: stop quickly.
+MAX_CONSECUTIVE_UNREACHABLE = 3
+# A 5xx is different in kind: the server answered, so it is up and reachable —
+# it choked on this payload. A season the endpoint cannot digest is a run of
+# per-file rejections, not an outage, and must not stop a whole library. Kept
+# finite so a genuinely broken endpoint (its database down, every upload 500)
+# still stops the run instead of grinding through every file.
+MAX_CONSECUTIVE_SERVER_ERRORS = 12
 
 STANDALONE_AUDIO_EXTENSIONS = {
     "wav", "mp3", "aac", "flac", "ogg", "m4a", "opus",
@@ -155,6 +171,12 @@ for _canonical, _aliases in LANGUAGE_ALIASES.items():
 
 class UploaderError(RuntimeError):
     """A problem with one file or one track. The run continues."""
+
+
+class MissingTool(UploaderError):
+    """mediainfo/mkvmerge/mkvextract is not installed. Unlike every other probe
+    failure this cannot fix itself, so it must never be retried: doing so would
+    add a pointless wait to every file in the library."""
 
 
 class ServerDown(RuntimeError):
@@ -370,7 +392,7 @@ def run_capture(command: list[str], timeout: float = PROBE_TIMEOUT) -> subproces
             timeout=timeout,
         )
     except FileNotFoundError as exc:
-        raise UploaderError(f"{command[0]} is not installed or not on PATH") from exc
+        raise MissingTool(f"{command[0]} is not installed or not on PATH") from exc
     except subprocess.TimeoutExpired as exc:
         raise UploaderError(f"{command[0]} timed out after {timeout:.0f}s") from exc
 
@@ -381,8 +403,8 @@ def tool_diagnostics(completed: subprocess.CompletedProcess) -> str:
     return tail(f"{completed.stderr} {completed.stdout}".strip()) or "no output"
 
 
-def run_json_command(command: list[str]) -> dict:
-    completed = run_capture(command)
+def run_json_command(command: list[str], timeout: float = PROBE_TIMEOUT) -> dict:
+    completed = run_capture(command, timeout=timeout)
     if completed.returncode > 1:  # 1 means "warnings" for the mkvtoolnix tools
         raise UploaderError(
             f"{command[0]} failed (exit {completed.returncode}): {tool_diagnostics(completed)}"
@@ -399,8 +421,8 @@ def run_json_command(command: list[str]) -> dict:
     return payload
 
 
-def run_text_command(command: list[str]) -> str:
-    completed = run_capture(command)
+def run_text_command(command: list[str], timeout: float = PROBE_TIMEOUT) -> str:
+    completed = run_capture(command, timeout=timeout)
     if not completed.stdout.strip():
         raise UploaderError(
             f"{command[0]} returned no output (exit {completed.returncode}): "
@@ -416,6 +438,36 @@ def run_extract_command(command: list[str]) -> None:
         raise UploaderError(
             f"mkvextract failed (exit {completed.returncode}): {tool_diagnostics(completed)}"
         )
+
+
+def retry_probe(label: str, probe):
+    """Run a probe, retrying the kind of failure that fixes itself.
+
+    Reading a container is not a pure function of the container: a disk that has
+    spun down, a NAS that drops a connection, or a file the downloader is still
+    writing all make a healthy file fail one probe and pass the next. Those
+    arrive as the same UploaderError as genuine damage, and the difference only
+    shows on a second look.
+
+    Retrying costs seconds. Not retrying costs the file permanently: every failed
+    probe consumes one of MAX_ATTEMPTS, so three unlucky moments across three runs
+    give up on a file that was never broken.
+    """
+    for attempt in range(1, PROBE_ATTEMPTS + 1):
+        try:
+            return probe()
+        except MissingTool:
+            raise
+        except UploaderError as exc:
+            if attempt == PROBE_ATTEMPTS:
+                raise
+            log_event(
+                "WARNING", label, "detect",
+                f"{exc}; retrying in {PROBE_RETRY_DELAY:.0f}s "
+                f"(attempt {attempt}/{PROBE_ATTEMPTS})",
+            )
+            time.sleep(PROBE_RETRY_DELAY)
+    raise AssertionError("unreachable")
 
 
 def normalize_language(value: str | None) -> str:
@@ -615,11 +667,85 @@ def check_container_readable(file_path: Path, mkvmerge_payload: dict) -> None:
         raise UploaderError(f"mkvmerge does not support the container of {file_path.name}")
 
 
+def video_track_of(media_info_payload: dict) -> dict | None:
+    for track in (media_info_payload.get("media") or {}).get("track") or []:
+        if str(track.get("@type", "")).lower() == "video":
+            return track
+    return None
+
+
+def has_video_frame_rate(media_info_payload: dict) -> bool:
+    return not is_missing_media_info_value(
+        get_media_info_value(video_track_of(media_info_payload), "frame_rate", "FrameRate")
+    )
+
+
+def add_missing_video_frame_rate(
+    file_path: Path, media_info_payload: dict, media_info_text: str
+) -> tuple[dict, str]:
+    """Recover a video frame rate that the container headers do not carry.
+
+    A variable-frame-rate encode stores no frame rate to read, so a header-only
+    probe reports ``FrameRate_Mode: VFR`` and no ``FrameRate`` at all. The
+    uploader endpoint needs that FPS and rejects the file without it ("Could not
+    parse original video FPS from MediaInfo") — which loses every track of every
+    VFR-encoded file, a whole season at a time.
+
+    A full parse walks the frame timestamps and computes the real average. That
+    reads the entire file, so it runs only for the files that actually need it,
+    and is best-effort: if it still yields nothing, the original payload goes out
+    unchanged and the server keeps the final say.
+    """
+    if has_video_frame_rate(media_info_payload):
+        return media_info_payload, media_info_text
+
+    log_event(
+        "INFO", file_path.name, "detect",
+        "no frame rate in the container headers (variable frame rate); "
+        "reparsing the file to compute it",
+    )
+    try:
+        deep_payload = run_json_command(
+            ["mediainfo", "--ParseSpeed=1.0", "--Output=JSON", str(file_path)],
+            timeout=DEEP_PROBE_TIMEOUT,
+        )
+        deep_text = run_text_command(
+            ["mediainfo", "--ParseSpeed=1.0", str(file_path)], timeout=DEEP_PROBE_TIMEOUT
+        )
+    except UploaderError as exc:
+        log_event(
+            "WARNING", file_path.name, "detect",
+            f"could not compute the frame rate ({exc}); uploading without it",
+        )
+        return media_info_payload, media_info_text
+
+    if not has_video_frame_rate(deep_payload):
+        log_event(
+            "WARNING", file_path.name, "detect",
+            "a full parse found no frame rate either; uploading without it",
+        )
+        return media_info_payload, media_info_text
+
+    frame_rate = get_media_info_value(video_track_of(deep_payload), "frame_rate", "FrameRate")
+    log_event("INFO", file_path.name, "detect", f"computed frame rate {frame_rate}")
+    return deep_payload, deep_text
+
+
 def collect_media_info(file_path: Path) -> tuple[dict[str, list[dict]], dict, str, dict]:
-    media_info_payload = run_json_command(["mediainfo", "--Output=JSON", str(file_path)])
-    media_info_text = run_text_command(["mediainfo", str(file_path)])
-    mkvmerge_payload = run_json_command(["mkvmerge", "-J", str(file_path)])
-    check_container_readable(file_path, mkvmerge_payload)
+    def probe() -> tuple[dict, str, dict]:
+        payload = run_json_command(["mediainfo", "--Output=JSON", str(file_path)])
+        text = run_text_command(["mediainfo", str(file_path)])
+        mkvmerge = run_json_command(["mkvmerge", "-J", str(file_path)])
+        # Inside the retry: an unreadable container is exactly the symptom a
+        # storage blip produces, and it is reported in the payload rather than
+        # raised by the command, so it has to be checked here to be retried.
+        check_container_readable(file_path, mkvmerge)
+        return payload, text, mkvmerge
+
+    media_info_payload, media_info_text, mkvmerge_payload = retry_probe(file_path.name, probe)
+    media_info_payload, media_info_text = add_missing_video_frame_rate(
+        file_path, media_info_payload, media_info_text
+    )
 
     tracks_by_type: dict[str, list[dict]] = {"video": [], "audio": [], "text": []}
     for track in (media_info_payload.get("media") or {}).get("track") or []:
@@ -798,8 +924,13 @@ def detect_standalone_language(media_info_track: dict | None, file_path: Path) -
 
 
 def collect_standalone_media_info(file_path: Path) -> tuple[dict, str, dict[str, list[dict]]]:
-    media_info_payload = run_json_command(["mediainfo", "--Output=JSON", str(file_path)])
-    media_info_text = run_text_command(["mediainfo", str(file_path)])
+    media_info_payload, media_info_text = retry_probe(
+        file_path.name,
+        lambda: (
+            run_json_command(["mediainfo", "--Output=JSON", str(file_path)]),
+            run_text_command(["mediainfo", str(file_path)]),
+        ),
+    )
     tracks_by_type: dict[str, list[dict]] = {"video": [], "audio": [], "text": []}
     for track in (media_info_payload.get("media") or {}).get("track") or []:
         track_type = str(track.get("@type", "")).lower()
@@ -1127,10 +1258,20 @@ def note_server_error(url: str, label: str, reason: str, exc: Exception) -> Exce
     host, and treating the first one as "the server is down" would stop the run
     on a healthy server — and, because a stopped run records no failure, replay
     that same file on every restart, forever.
+
+    How many in a row it takes depends on what came back. A 5xx response proves
+    the server is alive and talking, so a streak of them is far more likely to be
+    a folder of payloads it cannot digest than an outage; a streak of answers
+    that never arrive at all is the host being gone.
     """
     server_errors = _consecutive_server_errors.get(url, 0) + 1
     _consecutive_server_errors[url] = server_errors
-    if server_errors >= MAX_CONSECUTIVE_SERVER_ERRORS:
+    limit = (
+        MAX_CONSECUTIVE_SERVER_ERRORS
+        if isinstance(exc, httpx.HTTPStatusError)
+        else MAX_CONSECUTIVE_UNREACHABLE
+    )
+    if server_errors >= limit:
         return ServerDown(
             f"{request_target(url)} failed {server_errors} times in a row ({reason})"
         )

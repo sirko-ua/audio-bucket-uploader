@@ -1,22 +1,29 @@
 # Audio Bucket Uploader
 
-Extracts audio and subtitle tracks from `.mkv` files by language and uploads them to Audio Bucket.
+Extracts audio/subtitle tracks and embedded fonts from `.mkv` files and uploads them to Audio Bucket.
 
 ## Overview
 
 - finds one `.mkv` file or recursively scans a directory for `.mkv` files
-- extracts matching audio and subtitle tracks with `mkvextract`
+- extracts matching audio/subtitle tracks and embedded font attachments with one `mkvextract` invocation
 - names extracted files as:
 
 ```text
 {original_movie_name}_track{track_id_inside_container}.{detected_extension}
 ```
 
+Font attachments are named as:
+
+```text
+{original_movie_name}_attachment{attachment_id}_{safe_container_filename}
+```
+
 - uploads each extracted track to Audio Bucket as a draft or public track through `POST /api/uploader`
+- uploads each font attachment through `POST /api/uploader/attachments`, preserving its Matroska attachment UID
 - computes a BLAKE3-256 hash and checks `POST /api/uploader/hash-check` before uploading to prevent duplicates
 - sends the extracted `media_file`, original MKV MediaInfo JSON/text, MediaInfo `ID` as `track_id_inside_container`, and the selected `visibility` in the upload request
-- shows per-file extraction progress and per-file upload progress while each extracted track is being sent
-- with `--verbose`, prints detailed detection, HTTP request, upload result, and cleanup events
+- shows extraction/upload progress, successful results, skips, errors, and a final summary in one compact structured style
+- with `--verbose`, additionally prints file lists, extracted-media tables, HTTP status, `mkvextract` details, and cleanup paths
 - removes each extracted file after a successful upload unless `--keep-extracted` is set
 - optionally also uploads standalone (loose) audio and subtitle files found next to their source video (see [Standalone files](#standalone-files))
 
@@ -29,13 +36,31 @@ Extracts audio and subtitle tracks from `.mkv` files by language and uploads the
 | `--input` | No | `/input` | Path to a single `.mkv` file or a directory containing `.mkv` files. Directories are scanned recursively. |
 | `--audio-language` | No | `uk` | Target audio track language. Pass it multiple times or use comma-separated values, for example `--audio-language uk --audio-language en` or `--audio-language uk,en`. |
 | `--subtitle-language` | No | `all` | Target subtitle track language. Pass it multiple times or use comma-separated values. `all` uploads every subtitle track regardless of language. |
-| `--output-dir` | No | OS-specific temp directory | Directory where extracted tracks are written before upload. On macOS and Linux this is typically `/tmp`; on Windows it follows the standard temp location from the OS environment. |
+| `--output-dir` | No | OS-specific temp directory | Directory where extracted tracks and font attachments are written before upload. On macOS and Linux this is typically `/tmp`; on Windows it follows the standard temp location from the OS environment. |
 | `--keep-extracted` | No | `false` | Keep extracted files after successful upload. By default, uploaded extracted files are deleted. |
 | `--visibility` | No | `public` | Visibility for uploaded tracks: `draft` or `public`. |
 | `--standalone`, `--no-standalone` | No | `true` | Also discover and upload standalone (loose) audio/subtitle files. See [Standalone files](#standalone-files). Use `--no-standalone` to process `.mkv` files only. |
-| `--verbose`, `--no-verbose` | No | `false` | Print detailed file detection, HTTP request, upload result, and cleanup output. Detected files are shown as one-column full-path tables. Requests show only the method, path, response code, or exception—never their bodies. |
+| `--verbose`, `--no-verbose` | No | `false` | Additionally print file lists, extracted-media tables, HTTP status, `mkvextract` details, and cleanup paths. Requests never show their bodies. |
 
 Language filters are normalized, and common aliases are supported for languages such as `uk`, `ukr`, and `ukrainian`.
+
+## Log output
+
+Every log event uses `timestamp | level | target | action | details`. Default output contains the run-level counts, extraction/upload progress, outcomes, skips, errors, and final summary. Details use compact `key=value` fields where practical. `--verbose` adds diagnostics without changing the format.
+
+```text
+<timestamp> | INFO | Movie.mkv | extract | tracks=2 attachments=4
+<timestamp> | INFO | Movie_track2.eac3 | upload | kind=track type=audio visibility=public id=123
+<timestamp> | INFO | run | summary | tracks_extracted=2 attachments_extracted=4 tracks_uploaded=2 attachments_uploaded=4 already_published=0 standalone_uploaded=0 standalone_skipped=0 failed=0
+```
+
+## Font attachments
+
+Font attachments are discovered from the structured `attachments` array produced by `mkvmerge -J`. The uploader recognizes the official Matroska font MIME types, their common legacy forms, and font extensions on generic `application/octet-stream` attachments. Covers and other non-font attachments are ignored.
+
+Tracks and fonts are passed to separate extraction modes in one `mkvextract` command, avoiding a second extraction pass over the MKV. Embedded filenames are reduced to safe filename components before writing to `--output-dir`; an attachment cannot select a directory through its container filename.
+
+Each font is uploaded to the URL formed by appending `/attachments` to `--api-url`. For example, `https://audio-bucket.site/api/uploader` becomes `https://audio-bucket.site/api/uploader/attachments`. The multipart request contains `original_video_mediainfo`, `original_video_mediainfo_text`, `media_file`, the filename stored in the container as `original_filename`, and the attachment's unsigned 64-bit `uid`. Uploaded font files are removed unless `--keep-extracted` is set.
 
 ## Standalone files
 
@@ -59,7 +84,7 @@ Before each upload, the uploader computes the extracted file’s 64-character BL
 
 The duplicate check is based only on the file hash and is not affected by `--visibility`: it runs the same way for both `public` and `draft`. The `--visibility` value is used only for an actual upload after the API returns `{"exists": false}`. Therefore, rerunning with a different visibility also skips the file if the API already finds that hash.
 
-The check applies to standalone files as well.
+The check applies to standalone track files as well. Font attachments are uploaded by UID through the attachments endpoint and do not use the track hash-check endpoint.
 
 ## Easiest Way to Run (macOS and Linux)
 

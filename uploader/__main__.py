@@ -98,6 +98,24 @@ TRACK_TYPE_EXTENSION_DEFAULTS = {
     "subtitles": "sub",
 }
 
+FONT_ATTACHMENT_CONTENT_TYPES = {
+    # RFC 8081 media types recommended by Matroska.
+    "font/collection",
+    "font/otf",
+    "font/sfnt",
+    "font/ttf",
+    "font/woff",
+    "font/woff2",
+    # Legacy media types found in older Matroska files.
+    "application/font-sfnt",
+    "application/font-woff",
+    "application/vnd.ms-opentype",
+    "application/x-font-ttf",
+    "application/x-truetype-font",
+}
+FONT_ATTACHMENT_EXTENSIONS = {".otf", ".ttc", ".ttf", ".woff", ".woff2"}
+GENERIC_ATTACHMENT_CONTENT_TYPES = {"", "application/octet-stream"}
+
 ALL_SUBTITLE_LANGUAGES = "__all_subtitle_languages__"
 DEFAULT_AUDIO_LANGUAGES = ["uk"]
 DEFAULT_SUBTITLE_LANGUAGES = ["all"]
@@ -148,6 +166,17 @@ class PreparedTrack:
     cleanup_after_upload: bool = True
 
 
+@dataclass
+class PreparedAttachment:
+    extraction_attachment_id: int
+    uid: int
+    content_type: str
+    original_file_name: str
+    original_video_mediainfo: dict
+    original_video_mediainfo_text: str
+    output_path: Path
+
+
 class ProgressFile:
     def __init__(self, file_obj, total_size: int, label: str) -> None:
         self._file_obj = file_obj
@@ -155,6 +184,8 @@ class ProgressFile:
         self._label = label
         self._uploaded = 0
         self._last_percent = -1
+        self._last_log_bucket = 0
+        self._interactive = sys.stdout.isatty()
         self._line_open = False
 
     def read(self, size: int = -1) -> bytes:
@@ -169,19 +200,29 @@ class ProgressFile:
         if percent == self._last_percent:
             return
         self._last_percent = percent
+        if not self._interactive:
+            bucket = 4 if percent >= 100 else percent // 25
+            if bucket == 0 or bucket <= self._last_log_bucket:
+                return
+            self._last_log_bucket = bucket
         uploaded_mb = self._uploaded / (1024 * 1024)
         total_mb = self._total_size / (1024 * 1024)
-        message = f"{percent:3d}% ({uploaded_mb:.1f}/{total_mb:.1f} MiB)"
-        sys.stdout.write(f"\r{format_log_line('INFO', self._label, 'upload', message)}")
+        message = f"{percent:3d}% {uploaded_mb:.1f}/{total_mb:.1f} MiB"
+        prefix = "\r" if self._interactive else ""
+        suffix = "" if self._interactive else "\n"
+        sys.stdout.write(
+            f"{prefix}{format_log_line('INFO', self._label, 'upload', message)}{suffix}"
+        )
         sys.stdout.flush()
-        self._line_open = True
+        self._line_open = self._interactive
 
     def finish(self) -> None:
         self._uploaded = self._total_size
         self._render()
-        sys.stdout.write("\n")
-        sys.stdout.flush()
-        self._line_open = False
+        if self._line_open:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+            self._line_open = False
 
     def close_line(self) -> None:
         if self._line_open:
@@ -193,9 +234,57 @@ class ProgressFile:
         return getattr(self._file_obj, name)
 
 
+class ExtractionProgress:
+    def __init__(self, label: str) -> None:
+        self._label = label
+        self._last_percent = -1
+        self._last_log_bucket = 0
+        self._interactive = sys.stdout.isatty()
+        self._line_open = False
+
+    def update(self, percent: int) -> None:
+        percent = max(0, min(percent, 100))
+        if percent == self._last_percent:
+            return
+        self._last_percent = percent
+        if not self._interactive:
+            bucket = 4 if percent >= 100 else percent // 25
+            if (
+                bucket == 0
+                or bucket <= self._last_log_bucket
+                or (percent < 100 and percent % 25 != 0)
+            ):
+                return
+            self._last_log_bucket = bucket
+        prefix = "\r" if self._interactive else ""
+        suffix = "" if self._interactive else "\n"
+        sys.stdout.write(
+            f"{prefix}{format_log_line('INFO', self._label, 'extract', f'{percent:3d}%')}{suffix}"
+        )
+        sys.stdout.flush()
+        self._line_open = self._interactive
+
+    def finish(self) -> None:
+        if self._last_percent < 100:
+            self.update(100)
+        if self._line_open:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+            self._line_open = False
+
+    def close_line(self) -> None:
+        if self._line_open:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+            self._line_open = False
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Extract target-language audio and subtitle tracks from MKV files.",
+        description=(
+            "Extract and upload target-language audio/subtitle tracks and embedded "
+            "font attachments from MKV files."
+        ),
     )
     parser.add_argument("--api-key", required=True, help="Audio Bucket user API key.")
     parser.add_argument(
@@ -223,12 +312,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-dir",
         default=str(get_default_output_dir()),
-        help=f"Directory where extracted tracks will be written. Defaults to the system temp directory ({get_default_output_dir()}).",
+        help=f"Directory where extracted tracks and font attachments will be written. Defaults to the system temp directory ({get_default_output_dir()}).",
     )
     parser.add_argument(
         "--keep-extracted",
         action="store_true",
-        help="Keep extracted files after successful upload instead of deleting them.",
+        help="Keep extracted tracks and font attachments after successful upload instead of deleting them.",
     )
     parser.add_argument(
         "--visibility",
@@ -256,7 +345,10 @@ def parse_args() -> argparse.Namespace:
         "--verbose",
         action=argparse.BooleanOptionalAction,
         default=DEFAULT_VERBOSE,
-        help="Print detailed detection, HTTP request, upload result, and cleanup output. Defaults to false.",
+        help=(
+            "Print file lists, extracted-media tables, HTTP status, mkvextract "
+            "details, and cleanup paths. Defaults to false."
+        ),
     )
     return parser.parse_args()
 
@@ -325,8 +417,62 @@ def sanitize_media_info_paths(
     return media_info_payload, media_info_text
 
 
-def run_command(command: list[str]) -> None:
-    subprocess.run(command, check=True)
+def run_command(
+    command: list[str],
+    *,
+    progress_target: str,
+    verbose: bool,
+) -> None:
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        bufsize=1,
+    )
+    if process.stdout is None:
+        raise UploaderError("Could not read mkvextract output")
+
+    progress = ExtractionProgress(progress_target)
+    messages: list[str] = []
+    for raw_line in process.stdout:
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        progress_match = re.fullmatch(r"#GUI#progress\s+(\d+)%", line)
+        if progress_match:
+            progress.update(int(progress_match.group(1)))
+            continue
+
+        progress.close_line()
+        gui_message = re.fullmatch(r"#GUI#(warning|error)\s+(.*)", line)
+        if gui_message:
+            message = gui_message.group(2)
+            messages.append(message)
+            if gui_message.group(1) == "warning":
+                log_event("WARNING", progress_target, "extract", f"warning={message}")
+            continue
+
+        messages.append(line)
+        log_event(
+            "INFO",
+            progress_target,
+            "extract-detail",
+            line,
+            verbose=verbose,
+        )
+
+    return_code = process.wait()
+    if return_code == 0:
+        progress.finish()
+        return
+
+    progress.close_line()
+    detail = messages[-1] if messages else "no error details"
+    raise UploaderError(f"mkvextract failed code={return_code} error={detail}")
 
 
 def normalize_language(value: str | None) -> str:
@@ -439,6 +585,24 @@ def normalize_movie_name(file_path: Path) -> str:
     return normalized or file_path.stem
 
 
+def safe_attachment_file_name(value: object, attachment_id: int) -> str:
+    """Return a filename only, never a path supplied by the MKV attachment."""
+    raw_name = str(value or "").replace("\\", "/").rsplit("/", 1)[-1].strip()
+    sanitized = re.sub(r'[\x00-\x1f<>:"/\\|?*]+', "_", raw_name)
+    sanitized = re.sub(r"\s+", " ", sanitized).strip(" .")
+    return sanitized or f"attachment{attachment_id}.bin"
+
+
+def is_font_attachment(attachment: dict) -> bool:
+    content_type = str(attachment.get("content_type") or "").strip().lower()
+    if content_type in FONT_ATTACHMENT_CONTENT_TYPES:
+        return True
+    if content_type not in GENERIC_ATTACHMENT_CONTENT_TYPES:
+        return False
+    suffix = Path(str(attachment.get("file_name") or "")).suffix.lower()
+    return suffix in FONT_ATTACHMENT_EXTENSIONS
+
+
 def detect_extension(codec: str, track_type: str) -> str:
     normalized_codec = canonicalize_codec(codec)
     return CODEC_EXTENSION_MAP.get(normalized_codec, TRACK_TYPE_EXTENSION_DEFAULTS[track_type])
@@ -526,12 +690,15 @@ def collect_media_info(file_path: Path) -> tuple[dict[str, list[dict]], dict, st
     return tracks_by_type, media_info_payload, media_info_text, mkvmerge_payload
 
 
-def build_prepared_tracks(
+def build_prepared_tracks_from_metadata(
     file_path: Path,
     output_dir: Path,
     target_languages_by_type: dict[str, list[str]],
+    media_info_by_type: dict[str, list[dict]],
+    media_info_payload: dict,
+    media_info_text: str,
+    mkvmerge_payload: dict,
 ) -> list[PreparedTrack]:
-    media_info_by_type, media_info_payload, media_info_text, mkvmerge_payload = collect_media_info(file_path)
     movie_name = normalize_movie_name(file_path)
 
     type_indices = {"audio": 0, "subtitles": 0}
@@ -584,6 +751,88 @@ def build_prepared_tracks(
             )
         )
 
+    return prepared_tracks
+
+
+def build_prepared_attachments_from_metadata(
+    file_path: Path,
+    output_dir: Path,
+    media_info_payload: dict,
+    media_info_text: str,
+    mkvmerge_payload: dict,
+) -> list[PreparedAttachment]:
+    movie_name = normalize_movie_name(file_path)
+    prepared_attachments: list[PreparedAttachment] = []
+
+    for attachment in mkvmerge_payload.get("attachments", []):
+        if not is_font_attachment(attachment):
+            continue
+
+        attachment_id = attachment.get("id")
+        uid = attachment.get("properties", {}).get("uid")
+        if attachment_id is None:
+            raise UploaderError(f"Font attachment has no extraction ID in {file_path.name}")
+        if uid is None:
+            raise UploaderError(
+                f"Font attachment {attachment_id} has no UID in {file_path.name}"
+            )
+
+        original_file_name = str(attachment.get("file_name") or "")
+        safe_file_name = safe_attachment_file_name(original_file_name, int(attachment_id))
+        output_path = output_dir / (
+            f"{movie_name}_attachment{int(attachment_id)}_{safe_file_name}"
+        )
+        prepared_attachments.append(
+            PreparedAttachment(
+                extraction_attachment_id=int(attachment_id),
+                uid=int(uid),
+                content_type=str(attachment.get("content_type") or ""),
+                original_file_name=original_file_name,
+                original_video_mediainfo=media_info_payload,
+                original_video_mediainfo_text=media_info_text,
+                output_path=output_path,
+            )
+        )
+
+    return prepared_attachments
+
+
+def build_prepared_media(
+    file_path: Path,
+    output_dir: Path,
+    target_languages_by_type: dict[str, list[str]],
+) -> tuple[list[PreparedTrack], list[PreparedAttachment]]:
+    media_info_by_type, media_info_payload, media_info_text, mkvmerge_payload = collect_media_info(
+        file_path
+    )
+    prepared_tracks = build_prepared_tracks_from_metadata(
+        file_path,
+        output_dir,
+        target_languages_by_type,
+        media_info_by_type,
+        media_info_payload,
+        media_info_text,
+        mkvmerge_payload,
+    )
+    prepared_attachments = build_prepared_attachments_from_metadata(
+        file_path,
+        output_dir,
+        media_info_payload,
+        media_info_text,
+        mkvmerge_payload,
+    )
+    return prepared_tracks, prepared_attachments
+
+
+def build_prepared_tracks(
+    file_path: Path,
+    output_dir: Path,
+    target_languages_by_type: dict[str, list[str]],
+) -> list[PreparedTrack]:
+    """Compatibility wrapper for callers that only need container tracks."""
+    prepared_tracks, _ = build_prepared_media(
+        file_path, output_dir, target_languages_by_type
+    )
     return prepared_tracks
 
 
@@ -872,15 +1121,39 @@ def build_standalone_track(
     )
 
 
-def extract_tracks(file_path: Path, prepared_tracks: list[PreparedTrack]) -> None:
+def extract_media(
+    file_path: Path,
+    prepared_tracks: list[PreparedTrack],
+    prepared_attachments: list[PreparedAttachment],
+    *,
+    verbose: bool = False,
+) -> None:
     extractable = [track for track in prepared_tracks if track.extraction_track_id is not None]
-    if not extractable:
+    if not extractable and not prepared_attachments:
         return
-    command = ["mkvextract", "tracks", str(file_path)]
+
+    # Source-first syntax allows multiple extraction modes in one invocation,
+    # so MKVToolNix can extract tracks and attachments in a single pass.
+    command = ["mkvextract", "--gui-mode", str(file_path)]
+    if extractable:
+        command.append("tracks")
     for prepared_track in extractable:
         prepared_track.output_path.parent.mkdir(parents=True, exist_ok=True)
         command.append(f"{prepared_track.extraction_track_id}:{prepared_track.output_path}")
-    run_command(command)
+
+    if prepared_attachments:
+        command.append("attachments")
+    for prepared_attachment in prepared_attachments:
+        prepared_attachment.output_path.parent.mkdir(parents=True, exist_ok=True)
+        command.append(
+            f"{prepared_attachment.extraction_attachment_id}:{prepared_attachment.output_path}"
+        )
+    run_command(command, progress_target=file_path.name, verbose=verbose)
+
+
+def extract_tracks(file_path: Path, prepared_tracks: list[PreparedTrack]) -> None:
+    """Compatibility wrapper for callers that only extract tracks."""
+    extract_media(file_path, prepared_tracks, [])
 
 
 def get_file_hash(file_path: Path) -> str:
@@ -901,6 +1174,11 @@ def hash_check_url(api_url: str) -> str:
     return urlunsplit(parsed._replace(path=f"{parsed.path.rstrip('/')}/hash-check"))
 
 
+def attachments_upload_url(api_url: str) -> str:
+    parsed = urlsplit(api_url)
+    return urlunsplit(parsed._replace(path=f"{parsed.path.rstrip('/')}/attachments"))
+
+
 def log_request(
     method: str,
     url: str,
@@ -911,19 +1189,10 @@ def log_request(
 ) -> None:
     log_event(
         level,
-        "request",
         f"{method.upper()} {request_target(url)}",
+        "request",
         explanation,
         verbose=verbose,
-    )
-
-
-def warn_hash_check_prevented_upload(file_path: Path) -> None:
-    log_event(
-        "WARNING",
-        file_path.name,
-        "upload",
-        "file will not be uploaded because the hash check did not pass",
     )
 
 
@@ -934,7 +1203,6 @@ def is_track_already_published(api_url: str, api_key: str, file_path: Path, *, v
         "file_hash": file_hash,
         "file_hash_algorithm": "blake3-256",
     }
-    log_request("POST", check_url, "sending request", verbose=verbose)
     try:
         response = httpx.post(
             check_url,
@@ -943,30 +1211,35 @@ def is_track_already_published(api_url: str, api_key: str, file_path: Path, *, v
             timeout=60.0,
         )
         response.raise_for_status()
-        log_request("POST", check_url, f"response {response.status_code}", verbose=verbose)
+        log_request("POST", check_url, f"status={response.status_code}", verbose=verbose)
     except httpx.HTTPStatusError as exc:
         log_request(
-            "POST", check_url, f"exception: HTTP {exc.response.status_code}",
-            verbose=True, level="ERROR",
+            "POST",
+            check_url,
+            f"status={exc.response.status_code}",
+            verbose=verbose,
+            level="ERROR",
         )
-        warn_hash_check_prevented_upload(file_path)
         raise UploaderError(
-            f"Hash check failed for {file_path.name}: HTTP {exc.response.status_code}"
+            f"hash-check failed file={file_path.name} status={exc.response.status_code}"
         ) from exc
     except httpx.HTTPError as exc:
-        log_request("POST", check_url, f"exception: {exc}", verbose=True, level="ERROR")
-        warn_hash_check_prevented_upload(file_path)
-        raise UploaderError(f"Hash check failed for {file_path.name}: {exc}") from exc
+        log_request(
+            "POST", check_url, f"error={exc}", verbose=verbose, level="ERROR"
+        )
+        raise UploaderError(f"hash-check failed file={file_path.name} error={exc}") from exc
 
     try:
         payload = response.json()
     except json.JSONDecodeError as exc:
-        warn_hash_check_prevented_upload(file_path)
-        raise UploaderError(f"Hash check response was not valid JSON for {file_path.name}") from exc
+        raise UploaderError(
+            f"hash-check failed file={file_path.name} error=invalid-json"
+        ) from exc
 
     if not isinstance(payload, dict) or not isinstance(payload.get("exists"), bool):
-        warn_hash_check_prevented_upload(file_path)
-        raise UploaderError(f"Hash check response did not contain a boolean 'exists' value for {file_path.name}")
+        raise UploaderError(
+            f"hash-check failed file={file_path.name} error=missing-exists"
+        )
     return payload["exists"]
 
 
@@ -983,7 +1256,6 @@ def upload_prepared_track(
 
     file_size = prepared_track.output_path.stat().st_size
     progress_file: ProgressFile | None = None
-    log_request("POST", api_url, "sending request", verbose=verbose)
     try:
         with prepared_track.output_path.open("rb") as media_file:
             progress_file = ProgressFile(media_file, file_size, prepared_track.output_path.name)
@@ -1001,27 +1273,120 @@ def upload_prepared_track(
             )
             progress_file.finish()
             response.raise_for_status()
-            log_request("POST", api_url, f"response {response.status_code}", verbose=verbose)
+            log_request("POST", api_url, f"status={response.status_code}", verbose=verbose)
     except httpx.HTTPStatusError as exc:
         if progress_file is not None:
             progress_file.close_line()
         log_request(
-            "POST", api_url, f"exception: HTTP {exc.response.status_code}",
-            verbose=True, level="ERROR",
+            "POST",
+            api_url,
+            f"status={exc.response.status_code}",
+            verbose=verbose,
+            level="ERROR",
         )
         raise UploaderError(
-            f"Upload failed for {prepared_track.output_path.name}: HTTP {exc.response.status_code}"
+            f"upload failed file={prepared_track.output_path.name} "
+            f"status={exc.response.status_code}"
         ) from exc
     except httpx.HTTPError as exc:
         if progress_file is not None:
             progress_file.close_line()
-        log_request("POST", api_url, f"exception: {exc}", verbose=True, level="ERROR")
-        raise UploaderError(f"Upload failed for {prepared_track.output_path.name}: {exc}") from exc
+        log_request(
+            "POST", api_url, f"error={exc}", verbose=verbose, level="ERROR"
+        )
+        raise UploaderError(
+            f"upload failed file={prepared_track.output_path.name} error={exc}"
+        ) from exc
 
     try:
         return response.json()
     except json.JSONDecodeError as exc:
-        raise UploaderError(f"Upload response was not valid JSON for {prepared_track.output_path.name}") from exc
+        raise UploaderError(
+            f"upload failed file={prepared_track.output_path.name} error=invalid-json"
+        ) from exc
+
+
+def upload_prepared_attachment(
+    api_url: str,
+    api_key: str,
+    prepared_attachment: PreparedAttachment,
+    *,
+    verbose: bool,
+) -> dict:
+    if not prepared_attachment.output_path.is_file():
+        raise UploaderError(
+            f"Cannot upload missing extracted attachment: {prepared_attachment.output_path}"
+        )
+
+    upload_url = attachments_upload_url(api_url)
+    file_size = prepared_attachment.output_path.stat().st_size
+    progress_file: ProgressFile | None = None
+    try:
+        with prepared_attachment.output_path.open("rb") as media_file:
+            progress_file = ProgressFile(
+                media_file, file_size, prepared_attachment.output_path.name
+            )
+            response = httpx.post(
+                upload_url,
+                headers={"Authorization": f"Bearer {api_key}"},
+                data={
+                    "original_video_mediainfo": json.dumps(
+                        prepared_attachment.original_video_mediainfo
+                    ),
+                    "original_video_mediainfo_text": (
+                        prepared_attachment.original_video_mediainfo_text
+                    ),
+                    "original_filename": prepared_attachment.original_file_name,
+                    "uid": str(prepared_attachment.uid),
+                },
+                files={
+                    "media_file": (
+                        prepared_attachment.output_path.name,
+                        progress_file,
+                    )
+                },
+                timeout=60.0 * 10,
+            )
+            progress_file.finish()
+            response.raise_for_status()
+            log_request(
+                "POST", upload_url, f"status={response.status_code}", verbose=verbose
+            )
+    except httpx.HTTPStatusError as exc:
+        if progress_file is not None:
+            progress_file.close_line()
+        log_request(
+            "POST",
+            upload_url,
+            f"status={exc.response.status_code}",
+            verbose=verbose,
+            level="ERROR",
+        )
+        raise UploaderError(
+            f"attachment upload failed file={prepared_attachment.output_path.name} "
+            f"uid={prepared_attachment.uid} status={exc.response.status_code}"
+        ) from exc
+    except httpx.HTTPError as exc:
+        if progress_file is not None:
+            progress_file.close_line()
+        log_request(
+            "POST", upload_url, f"error={exc}", verbose=verbose, level="ERROR"
+        )
+        raise UploaderError(
+            f"attachment upload failed file={prepared_attachment.output_path.name} "
+            f"uid={prepared_attachment.uid} error={exc}"
+        ) from exc
+
+    if not response.content:
+        return {}
+    try:
+        payload = response.json()
+    except json.JSONDecodeError as exc:
+        raise UploaderError(
+            f"attachment upload failed file={prepared_attachment.output_path.name} "
+            f"uid={prepared_attachment.uid} error=invalid-json"
+        ) from exc
+    return payload if isinstance(payload, dict) else {}
 
 
 def format_table(headers: list[str], rows: list[list[object]]) -> str:
@@ -1081,13 +1446,17 @@ def get_default_output_dir() -> Path:
     return Path(tempfile.gettempdir()).resolve()
 
 
-def remove_extracted_file(prepared_track: PreparedTrack) -> None:
+def remove_extracted_file(
+    prepared_media: PreparedTrack | PreparedAttachment,
+) -> None:
     try:
-        prepared_track.output_path.unlink()
+        prepared_media.output_path.unlink()
     except FileNotFoundError:
         return
     except OSError as exc:
-        raise UploaderError(f"Uploaded {prepared_track.output_path.name} but failed to remove it: {exc}") from exc
+        raise UploaderError(
+            f"Uploaded {prepared_media.output_path.name} but failed to remove it: {exc}"
+        ) from exc
 
 
 def main() -> int:
@@ -1139,56 +1508,73 @@ def main() -> int:
         "INFO",
         "input",
         "detect",
-        f"found {len(mkv_files)} MKV file(s) and {len(standalone_files)} standalone file(s)",
+        f"mkv={len(mkv_files)} standalone={len(standalone_files)}",
     )
     log_table(
-        "Detected MKV files:",
-        ["full path"],
+        "mkv-files",
+        ["path"],
         [[file_path] for file_path in mkv_files],
         verbose=args.verbose,
-        target="MKV files",
+        target="input",
         action="detect",
     )
     log_table(
-        "Detected standalone files:",
-        ["full path"],
+        "standalone-files",
+        ["path"],
         [[file_path] for file_path in standalone_files],
         verbose=args.verbose,
-        target="standalone files",
+        target="input",
         action="detect",
     )
 
     extracted_count = 0
+    extracted_attachment_count = 0
     uploaded_count = 0
+    uploaded_attachment_count = 0
     skipped_count = 0
     failed_files: list[tuple[Path, str]] = []
     for file_path in mkv_files:
         try:
-            log_event("INFO", file_path.name, "inspect", str(file_path), verbose=args.verbose)
-            prepared_tracks = build_prepared_tracks(file_path, output_dir, target_languages_by_type)
-            if not prepared_tracks:
+            log_event(
+                "INFO",
+                file_path.name,
+                "inspect",
+                f"path={file_path}",
+                verbose=args.verbose,
+            )
+            prepared_tracks, prepared_attachments = build_prepared_media(
+                file_path, output_dir, target_languages_by_type
+            )
+            if not prepared_tracks and not prepared_attachments:
                 subtitle_filter_label = (
                     "all"
                     if target_languages_by_type["subtitles"] == [ALL_SUBTITLE_LANGUAGES]
-                    else ", ".join(target_languages_by_type["subtitles"])
+                    else ",".join(target_languages_by_type["subtitles"])
                 )
                 log_event(
                     "WARNING",
                     file_path.name,
-                    "extract",
-                    f"skipped: no matching audio tracks for {', '.join(target_languages_by_type['audio'])} "
-                    f"or subtitle tracks for {subtitle_filter_label} found",
+                    "skip",
+                    f"reason=no-matching-media "
+                    f"audio={','.join(target_languages_by_type['audio'])} "
+                    f"subtitles={subtitle_filter_label} attachments=0",
                 )
                 continue
             log_event(
                 "INFO", file_path.name, "extract",
-                f"extracting {len(prepared_tracks)} track(s)",
+                f"tracks={len(prepared_tracks)} attachments={len(prepared_attachments)}",
             )
-            extract_tracks(file_path, prepared_tracks)
+            extract_media(
+                file_path,
+                prepared_tracks,
+                prepared_attachments,
+                verbose=args.verbose,
+            )
             extracted_count += len(prepared_tracks)
+            extracted_attachment_count += len(prepared_attachments)
             log_table(
-                f"Extracted tracks for {file_path.name}:",
-                ["mediainfo_id", "type", "language", "path"],
+                "tracks",
+                ["id", "type", "language", "path"],
                 [
                     [
                         prepared_track.media_info_track_id,
@@ -1198,6 +1584,23 @@ def main() -> int:
                     ]
                     for prepared_track in prepared_tracks
                 ],
+                verbose=args.verbose,
+                target=file_path.name,
+                action="extract",
+            )
+            log_table(
+                "attachments",
+                ["uid", "mime", "original_name", "path"],
+                [
+                    [
+                        prepared_attachment.uid,
+                        prepared_attachment.content_type,
+                        prepared_attachment.original_file_name,
+                        prepared_attachment.output_path,
+                    ]
+                    for prepared_attachment in prepared_attachments
+                ],
+                verbose=args.verbose,
                 target=file_path.name,
                 action="extract",
             )
@@ -1210,14 +1613,17 @@ def main() -> int:
                 ):
                     skipped_count += 1
                     log_event(
-                        "WARNING", prepared_track.output_path.name, "upload",
-                        "file will not be uploaded because the hash check reports it is already published",
+                        "WARNING",
+                        prepared_track.output_path.name,
+                        "skip",
+                        "reason=already-published",
                     )
                     if not args.keep_extracted and prepared_track.cleanup_after_upload:
                         remove_extracted_file(prepared_track)
                         log_event(
                             "INFO", prepared_track.output_path.name, "cleanup",
-                            f"removed {prepared_track.output_path}", verbose=args.verbose,
+                            f"path={prepared_track.output_path}",
+                            verbose=args.verbose,
                         )
                     continue
                 upload_response = upload_prepared_track(
@@ -1228,27 +1634,63 @@ def main() -> int:
                     verbose=args.verbose,
                 )
                 uploaded_count += 1
+                response_id = upload_response.get("id")
+                id_detail = f" id={response_id}" if response_id is not None else ""
                 log_event(
-                    "INFO", prepared_track.output_path.name, "upload",
-                    f"uploaded as {args.visibility} track {upload_response.get('id')}",
-                    verbose=args.verbose,
+                    "INFO",
+                    prepared_track.output_path.name,
+                    "upload",
+                    f"kind=track type={prepared_track.track_type} "
+                    f"visibility={args.visibility}{id_detail}",
                 )
                 if not args.keep_extracted and prepared_track.cleanup_after_upload:
                     remove_extracted_file(prepared_track)
                     log_event(
                         "INFO", prepared_track.output_path.name, "cleanup",
-                        f"removed {prepared_track.output_path}", verbose=args.verbose,
+                        f"path={prepared_track.output_path}",
+                        verbose=args.verbose,
+                    )
+            for prepared_attachment in prepared_attachments:
+                upload_response = upload_prepared_attachment(
+                    args.api_url,
+                    args.api_key,
+                    prepared_attachment,
+                    verbose=args.verbose,
+                )
+                uploaded_attachment_count += 1
+                response_id = upload_response.get("id")
+                id_detail = f" id={response_id}" if response_id is not None else ""
+                log_event(
+                    "INFO",
+                    prepared_attachment.output_path.name,
+                    "upload",
+                    f"kind=attachment uid={prepared_attachment.uid}{id_detail}",
+                )
+                if not args.keep_extracted:
+                    remove_extracted_file(prepared_attachment)
+                    log_event(
+                        "INFO",
+                        prepared_attachment.output_path.name,
+                        "cleanup",
+                        f"path={prepared_attachment.output_path}",
+                        verbose=args.verbose,
                     )
         except (UploaderError, subprocess.CalledProcessError, OSError, ValueError) as exc:
             failed_files.append((file_path, str(exc)))
-            log_event("ERROR", file_path.name, "process", f"skipped: {exc}")
+            log_event("ERROR", file_path.name, "process", f"status=failed error={exc}")
             continue
 
     standalone_uploaded_count = 0
     standalone_skipped_count = 0
     for file_path in standalone_files:
         try:
-            log_event("INFO", file_path.name, "inspect", str(file_path), verbose=args.verbose)
+            log_event(
+                "INFO",
+                file_path.name,
+                "inspect",
+                f"path={file_path}",
+                verbose=args.verbose,
+            )
             prepared_track = build_standalone_track(file_path, target_languages_by_type)
             if is_track_already_published(
                 args.api_url,
@@ -1259,13 +1701,16 @@ def main() -> int:
                 skipped_count += 1
                 standalone_skipped_count += 1
                 log_event(
-                    "WARNING", file_path.name, "upload",
-                    "file will not be uploaded because the hash check reports it is already published",
+                    "WARNING",
+                    file_path.name,
+                    "skip",
+                    "reason=already-published",
                 )
                 continue
             log_event(
                 "INFO", file_path.name, "upload",
-                f"uploading standalone {prepared_track.track_type}; language={prepared_track.language}",
+                f"kind=standalone type={prepared_track.track_type} "
+                f"language={prepared_track.language}",
                 verbose=args.verbose,
             )
             upload_response = upload_prepared_track(
@@ -1277,30 +1722,38 @@ def main() -> int:
             )
             uploaded_count += 1
             standalone_uploaded_count += 1
+            response_id = upload_response.get("id")
+            id_detail = f" id={response_id}" if response_id is not None else ""
             log_event(
-                "INFO", file_path.name, "upload",
-                f"uploaded as {args.visibility} track {upload_response.get('id')}",
-                verbose=args.verbose,
+                "INFO",
+                file_path.name,
+                "upload",
+                f"kind=standalone type={prepared_track.track_type} "
+                f"visibility={args.visibility}{id_detail}",
             )
         except StandaloneSkip as skip:
             standalone_skipped_count += 1
-            log_event("WARNING", file_path.name, "upload", f"standalone file will not be uploaded: {skip}")
+            log_event("WARNING", file_path.name, "skip", f"reason={skip}")
             continue
         except (UploaderError, subprocess.CalledProcessError, OSError, ValueError) as exc:
             failed_files.append((file_path, str(exc)))
-            log_event("ERROR", file_path.name, "process", f"skipped: {exc}")
+            log_event("ERROR", file_path.name, "process", f"status=failed error={exc}")
             continue
 
     log_event(
-        "INFO", "run", "summary",
-        f"prepared {extracted_count} extracted track file(s); "
-        f"uploaded {uploaded_count} {args.visibility} track(s) "
-        f"({standalone_uploaded_count} standalone, {standalone_skipped_count} standalone skipped); "
-        f"skipped {skipped_count} already published track(s)",
-        verbose=args.verbose,
+        "ERROR" if failed_files else "INFO",
+        "run",
+        "summary",
+        f"tracks_extracted={extracted_count} "
+        f"attachments_extracted={extracted_attachment_count} "
+        f"tracks_uploaded={uploaded_count} "
+        f"attachments_uploaded={uploaded_attachment_count} "
+        f"already_published={skipped_count} "
+        f"standalone_uploaded={standalone_uploaded_count} "
+        f"standalone_skipped={standalone_skipped_count} "
+        f"failed={len(failed_files)}",
     )
     if failed_files:
-        log_event("ERROR", "run", "summary", f"encountered errors on {len(failed_files)} file(s)")
         return 1
     return 0
 
@@ -1309,5 +1762,5 @@ if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except (UploaderError, subprocess.CalledProcessError, OSError, ValueError) as exc:
-        log_event("ERROR", "run", "startup", str(exc))
+        log_event("ERROR", "run", "startup", f"status=failed error={exc}")
         raise SystemExit(1) from exc

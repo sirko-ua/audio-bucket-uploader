@@ -157,7 +157,9 @@ class StandaloneSkip(Exception):
 @dataclass
 class PreparedTrack:
     extraction_track_id: int | None
-    media_info_track_id: str
+    # MediaInfo's ID is the public track_id_inside_container used by the API.
+    # It is not the same namespace as mkvextract's (mkvmerge) track ID.
+    media_info_track_id: int
     track_type: str
     language: str
     original_video_mediainfo: dict
@@ -175,6 +177,13 @@ class PreparedAttachment:
     original_video_mediainfo: dict
     original_video_mediainfo_text: str
     output_path: Path
+
+
+@dataclass(frozen=True)
+class OriginalVideoCheck:
+    exists: bool
+    track_ids_inside_container: frozenset[int]
+    attachment_original_filenames: frozenset[str]
 
 
 class ProgressFile:
@@ -641,10 +650,25 @@ def find_media_info_track(
             if str(get_media_info_value(track, "unique_id", "UniqueID")) == str(uid):
                 return track
 
+    # MediaInfo's StreamOrder identifies the stream used by mkvmerge/mkvextract.
+    # This is deliberately only used to find the matching MediaInfo record; the
+    # ID sent to the server is read from that record below.
+    extraction_track_id = mkvmerge_track.get("id")
+    if extraction_track_id is not None:
+        for track in tracks:
+            stream_order = parse_media_info_track_id(
+                get_media_info_value(track, "stream_order", "StreamOrder")
+            )
+            if stream_order == int(extraction_track_id):
+                return track
+
     track_number = properties.get("number")
     if track_number is not None:
         for track in tracks:
-            if str(get_media_info_value(track, "id", "ID")) == str(track_number):
+            media_info_id = parse_media_info_track_id(
+                get_media_info_value(track, "id", "ID")
+            )
+            if media_info_id == int(track_number):
                 return track
 
     if index >= len(tracks):
@@ -652,25 +676,49 @@ def find_media_info_track(
     return tracks[index]
 
 
-def get_media_info_track_id(media_info_track: dict | None, mkvmerge_track: dict) -> str:
+def parse_media_info_track_id(value: object | None) -> int | None:
+    """Parse MediaInfo's numeric ID without confusing it with stream order."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+
+    # Some MediaInfo formats include the hexadecimal rendering after the
+    # decimal ID (for example ``2 (0x2)``).
+    match = re.fullmatch(r"\s*(\d+)(?:\s+\(0x[0-9a-fA-F]+\))?\s*", str(value))
+    return int(match.group(1)) if match else None
+
+
+def get_media_info_track_id(media_info_track: dict | None, mkvmerge_track: dict) -> int:
     media_info_id = get_media_info_value(media_info_track, "id", "ID")
-    if media_info_id is not None:
-        return str(media_info_id)
+    parsed_id = parse_media_info_track_id(media_info_id)
+    if parsed_id is not None:
+        return parsed_id
 
-    track_number = mkvmerge_track.get("properties", {}).get("number")
-    if track_number is not None:
-        return str(track_number)
+    raise UploaderError(
+        f"Cannot find numeric MediaInfo ID for mkvextract track "
+        f"{mkvmerge_track.get('id')}"
+    )
 
-    raise UploaderError(f"Cannot find MediaInfo ID for container track {mkvmerge_track.get('id')}")
+
+def get_original_video_unique_id(media_info_payload: dict) -> str:
+    for track in media_info_payload.get("media", {}).get("track", []):
+        if str(track.get("@type", "")).lower() != "general":
+            continue
+        unique_id = get_media_info_value(track, "unique_id", "UniqueID")
+        if not is_missing_media_info_value(unique_id):
+            normalized = str(unique_id).strip()
+            if normalized:
+                return normalized
+    raise UploaderError("Cannot check original video: MediaInfo unique_id is missing")
 
 
 def media_info_has_unique_id(media_info_payload: dict) -> bool:
-    for track in media_info_payload.get("media", {}).get("track", []):
-        if str(track.get("@type", "")).lower() == "general":
-            unique_id = get_media_info_value(track, "unique_id", "UniqueID")
-            if not is_missing_media_info_value(unique_id):
-                return True
-    return False
+    try:
+        get_original_video_unique_id(media_info_payload)
+    except UploaderError:
+        return False
+    return True
 
 
 def collect_media_info(file_path: Path) -> tuple[dict[str, list[dict]], dict, str, dict]:
@@ -777,11 +825,14 @@ def build_prepared_attachments_from_metadata(
                 f"Font attachment {attachment_id} has no UID in {file_path.name}"
             )
 
-        original_file_name = str(attachment.get("file_name") or "")
-        safe_file_name = safe_attachment_file_name(original_file_name, int(attachment_id))
-        output_path = output_dir / (
+        container_file_name = str(attachment.get("file_name") or "")
+        safe_file_name = safe_attachment_file_name(
+            container_file_name, int(attachment_id)
+        )
+        original_file_name = (
             f"{movie_name}_attachment{int(attachment_id)}_{safe_file_name}"
         )
+        output_path = output_dir / original_file_name
         prepared_attachments.append(
             PreparedAttachment(
                 extraction_attachment_id=int(attachment_id),
@@ -971,7 +1022,7 @@ def choose_container_track_id(
     media_info_by_type: dict[str, list[dict]],
     track_type: str,
     language: str,
-) -> str | None:
+) -> int | None:
     """Find a track_id_inside_container in the source video for a standalone track.
 
     The endpoint reads the language of this track from the supplied MediaInfo, so
@@ -1012,7 +1063,7 @@ def add_synthetic_media_info_track(
     own_media_info_track: dict | None,
     track_type: str,
     language: str,
-) -> str:
+) -> int:
     """Append the standalone file's own MediaInfo track to the source video's
     MediaInfo, and return the container track id the endpoint should read it by.
 
@@ -1039,7 +1090,7 @@ def add_synthetic_media_info_track(
     # one would collide with a real track in the container.
     synthetic.pop("UniqueID", None)
     tracks.append(synthetic)
-    return str(new_id)
+    return new_id
 
 
 def build_standalone_track(
@@ -1174,6 +1225,13 @@ def hash_check_url(api_url: str) -> str:
     return urlunsplit(parsed._replace(path=f"{parsed.path.rstrip('/')}/hash-check"))
 
 
+def original_video_check_url(api_url: str) -> str:
+    parsed = urlsplit(api_url)
+    return urlunsplit(
+        parsed._replace(path=f"{parsed.path.rstrip('/')}/original-video-check")
+    )
+
+
 def attachments_upload_url(api_url: str) -> str:
     parsed = urlsplit(api_url)
     return urlunsplit(parsed._replace(path=f"{parsed.path.rstrip('/')}/attachments"))
@@ -1194,6 +1252,98 @@ def log_request(
         explanation,
         verbose=verbose,
     )
+
+
+def check_original_video(
+    api_url: str,
+    api_key: str,
+    unique_id: str,
+    *,
+    verbose: bool,
+) -> OriginalVideoCheck:
+    unique_id = unique_id.strip()
+    if not unique_id:
+        raise UploaderError("Cannot check original video: unique_id is empty")
+
+    check_url = original_video_check_url(api_url)
+    try:
+        response = httpx.post(
+            check_url,
+            headers={"X-API-Key": api_key},
+            json={"unique_id": unique_id},
+            timeout=60.0,
+        )
+        response.raise_for_status()
+        log_request("POST", check_url, f"status={response.status_code}", verbose=verbose)
+    except httpx.HTTPStatusError as exc:
+        log_request(
+            "POST",
+            check_url,
+            f"status={exc.response.status_code}",
+            verbose=verbose,
+            level="ERROR",
+        )
+        raise UploaderError(
+            f"original-video-check failed status={exc.response.status_code}"
+        ) from exc
+    except httpx.HTTPError as exc:
+        log_request(
+            "POST", check_url, f"error={exc}", verbose=verbose, level="ERROR"
+        )
+        raise UploaderError(f"original-video-check failed error={exc}") from exc
+
+    try:
+        payload = response.json()
+    except json.JSONDecodeError as exc:
+        raise UploaderError("original-video-check failed error=invalid-json") from exc
+
+    if not isinstance(payload, dict) or not isinstance(payload.get("exists"), bool):
+        raise UploaderError("original-video-check failed error=missing-exists")
+
+    track_ids = payload.get("track_ids_inside_container")
+    attachment_names = payload.get("attachment_original_filenames")
+    if not isinstance(track_ids, list) or any(
+        isinstance(track_id, bool) or not isinstance(track_id, int)
+        for track_id in track_ids
+    ):
+        raise UploaderError(
+            "original-video-check failed error=invalid-track-ids-inside-container"
+        )
+    if not isinstance(attachment_names, list) or any(
+        not isinstance(file_name, str) for file_name in attachment_names
+    ):
+        raise UploaderError(
+            "original-video-check failed error=invalid-attachment-original-filenames"
+        )
+
+    return OriginalVideoCheck(
+        exists=payload["exists"],
+        track_ids_inside_container=frozenset(track_ids),
+        attachment_original_filenames=frozenset(attachment_names),
+    )
+
+
+def filter_missing_media(
+    prepared_tracks: list[PreparedTrack],
+    prepared_attachments: list[PreparedAttachment],
+    original_video: OriginalVideoCheck,
+) -> tuple[list[PreparedTrack], list[PreparedAttachment]]:
+    if not original_video.exists:
+        return prepared_tracks, prepared_attachments
+
+    missing_tracks = [
+        track
+        for track in prepared_tracks
+        if track.media_info_track_id
+        not in original_video.track_ids_inside_container
+    ]
+    missing_attachments = [
+        attachment
+        for attachment in prepared_attachments
+        if attachment.original_file_name
+        not in original_video.attachment_original_filenames
+    ]
+    return missing_tracks, missing_attachments
 
 
 def is_track_already_published(api_url: str, api_key: str, file_path: Path, *, verbose: bool) -> bool:
@@ -1265,7 +1415,7 @@ def upload_prepared_track(
                 data={
                     "original_video_mediainfo": json.dumps(prepared_track.original_video_mediainfo),
                     "original_video_mediainfo_text": prepared_track.original_video_mediainfo_text,
-                    "track_id_inside_container": prepared_track.media_info_track_id,
+                    "track_id_inside_container": str(prepared_track.media_info_track_id),
                     "visibility": visibility,
                 },
                 files={"media_file": (prepared_track.output_path.name, progress_file)},
@@ -1532,6 +1682,7 @@ def main() -> int:
     uploaded_count = 0
     uploaded_attachment_count = 0
     skipped_count = 0
+    existing_attachment_count = 0
     failed_files: list[tuple[Path, str]] = []
     for file_path in mkv_files:
         try:
@@ -1558,6 +1709,50 @@ def main() -> int:
                     f"reason=no-matching-media "
                     f"audio={','.join(target_languages_by_type['audio'])} "
                     f"subtitles={subtitle_filter_label} attachments=0",
+                )
+                continue
+
+            media_info_payload = (
+                prepared_tracks[0].original_video_mediainfo
+                if prepared_tracks
+                else prepared_attachments[0].original_video_mediainfo
+            )
+            unique_id = get_original_video_unique_id(media_info_payload)
+            original_video = check_original_video(
+                args.api_url,
+                args.api_key,
+                unique_id,
+                verbose=args.verbose,
+            )
+            candidate_track_count = len(prepared_tracks)
+            candidate_attachment_count = len(prepared_attachments)
+            prepared_tracks, prepared_attachments = filter_missing_media(
+                prepared_tracks,
+                prepared_attachments,
+                original_video,
+            )
+            present_track_count = candidate_track_count - len(prepared_tracks)
+            present_attachment_count = (
+                candidate_attachment_count - len(prepared_attachments)
+            )
+            skipped_count += present_track_count
+            existing_attachment_count += present_attachment_count
+            log_event(
+                "INFO",
+                file_path.name,
+                "original-video-check",
+                f"exists={str(original_video.exists).lower()} "
+                f"tracks_missing={len(prepared_tracks)} "
+                f"tracks_present={present_track_count} "
+                f"attachments_missing={len(prepared_attachments)} "
+                f"attachments_present={present_attachment_count}",
+            )
+            if not prepared_tracks and not prepared_attachments:
+                log_event(
+                    "WARNING",
+                    file_path.name,
+                    "skip",
+                    "reason=no-missing-media",
                 )
                 continue
             log_event(
@@ -1749,6 +1944,7 @@ def main() -> int:
         f"tracks_uploaded={uploaded_count} "
         f"attachments_uploaded={uploaded_attachment_count} "
         f"already_published={skipped_count} "
+        f"attachments_already_present={existing_attachment_count} "
         f"standalone_uploaded={standalone_uploaded_count} "
         f"standalone_skipped={standalone_skipped_count} "
         f"failed={len(failed_files)}",

@@ -5,6 +5,7 @@ Extracts audio/subtitle tracks and embedded fonts from `.mkv` files and uploads 
 ## Overview
 
 - finds one `.mkv` file or recursively scans a directory for `.mkv` files
+- checks `POST /api/uploader/original-video-check` with the video's MediaInfo `unique_id` before extraction and skips tracks/attachments already stored by the server
 - extracts matching audio/subtitle tracks and embedded font attachments with one `mkvextract` invocation
 - names extracted files as:
 
@@ -31,7 +32,7 @@ Font attachments are named as:
 
 | Argument | Required | Default | Description |
 | --- | --- | --- | --- |
-| `--api-key` | Yes | none | Audio Bucket user API key. It is sent as a bearer token in the upload request. |
+| `--api-key` | Yes | none | Audio Bucket user API key. It is sent as a bearer token for uploads and in `X-API-Key` for the original-video check. |
 | `--api-url` | Yes | none | Audio Bucket uploader endpoint URL, for example `https://audio-bucket.site/api/uploader`. |
 | `--input` | No | `/input` | Path to a single `.mkv` file or a directory containing `.mkv` files. Directories are scanned recursively. |
 | `--audio-language` | No | `uk` | Target audio track language. Pass it multiple times or use comma-separated values, for example `--audio-language uk --audio-language en` or `--audio-language uk,en`. |
@@ -51,7 +52,7 @@ Every log event uses `timestamp | level | target | action | details`. Default ou
 ```text
 <timestamp> | INFO | Movie.mkv | extract | tracks=2 attachments=4
 <timestamp> | INFO | Movie_track2.eac3 | upload | kind=track type=audio visibility=public id=123
-<timestamp> | INFO | run | summary | tracks_extracted=2 attachments_extracted=4 tracks_uploaded=2 attachments_uploaded=4 already_published=0 standalone_uploaded=0 standalone_skipped=0 failed=0
+<timestamp> | INFO | run | summary | tracks_extracted=2 attachments_extracted=4 tracks_uploaded=2 attachments_uploaded=4 already_published=0 attachments_already_present=0 standalone_uploaded=0 standalone_skipped=0 failed=0
 ```
 
 ## Font attachments
@@ -60,7 +61,7 @@ Font attachments are discovered from the structured `attachments` array produced
 
 Tracks and fonts are passed to separate extraction modes in one `mkvextract` command, avoiding a second extraction pass over the MKV. Embedded filenames are reduced to safe filename components before writing to `--output-dir`; an attachment cannot select a directory through its container filename.
 
-Each font is uploaded to the URL formed by appending `/attachments` to `--api-url`. For example, `https://audio-bucket.site/api/uploader` becomes `https://audio-bucket.site/api/uploader/attachments`. The multipart request contains `original_video_mediainfo`, `original_video_mediainfo_text`, `media_file`, the filename stored in the container as `original_filename`, and the attachment's unsigned 64-bit `uid`. Uploaded font files are removed unless `--keep-extracted` is set.
+Each font is uploaded to the URL formed by appending `/attachments` to `--api-url`. For example, `https://audio-bucket.site/api/uploader` becomes `https://audio-bucket.site/api/uploader/attachments`. The multipart request contains `original_video_mediainfo`, `original_video_mediainfo_text`, `media_file`, the composite `{video_name}_attachment{attachment_id}_{container_filename}` value as `original_filename`, and the attachment's unsigned 64-bit `uid`. The multipart file name and `original_filename` always use the same composite value. Uploaded font files are removed unless `--keep-extracted` is set.
 
 ## Standalone files
 
@@ -79,6 +80,8 @@ The source video does **not** need to already contain a matching track. An exter
 Standalone source files are never deleted (`--keep-extracted` does not apply to them).
 
 ## Duplicate Check
+
+Before invoking `mkvextract`, the uploader sends the original video's MediaInfo `unique_id` to `POST /api/uploader/original-video-check` using the `X-API-Key` header. When the video exists, only MediaInfo track IDs absent from `track_ids_inside_container` and composite font filenames absent from `attachment_original_filenames` are extracted. MediaInfo `ID` values are mapped to their corresponding `mkvextract` track IDs (normally a different, zero-based number); the MediaInfo ID remains the value sent as `track_id_inside_container`.
 
 Before each upload, the uploader computes the extracted file’s 64-character BLAKE3-256 digest and sends it to `POST /api/uploader/hash-check`. If the API returns `{"exists": true}`, the file is treated as already published and the upload is skipped.
 

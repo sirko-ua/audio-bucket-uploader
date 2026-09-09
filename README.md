@@ -5,6 +5,7 @@
 ## Огляд
 
 - знаходить один файл `.mkv` або рекурсивно сканує каталог на наявність файлів `.mkv`
+- перед витяганням перевіряє `unique_id` відео з MediaInfo через `POST /api/uploader/original-video-check` і пропускає доріжки та вкладення, які вже зберігаються на сервері
 - витягує відповідні аудіодоріжки, доріжки субтитрів і вкладені файли шрифтів одним викликом `mkvextract`
 - називає витягнуті файли за шаблоном:
 
@@ -31,7 +32,7 @@
 
 | Аргумент | Обов’язковий | Типове значення | Опис |
 | --- | --- | --- | --- |
-| `--api-key` | Так | немає | API-ключ користувача Audio Bucket. Він надсилається як bearer-токен у запиті на завантаження. |
+| `--api-key` | Так | немає | API-ключ користувача Audio Bucket. Він надсилається як bearer-токен під час завантаження та в `X-API-Key` для перевірки оригінального відео. |
 | `--api-url` | Так | немає | URL кінцевої точки завантажувача Audio Bucket, наприклад `https://audio-bucket.site/api/uploader`. |
 | `--input` | Ні | `/input` | Шлях до одного файлу `.mkv` або каталогу з файлами `.mkv`. Каталоги скануються рекурсивно. |
 | `--audio-language` | Ні | `uk` | Мова цільової аудіодоріжки. Передавайте параметр кілька разів або використовуйте значення, розділені комами, наприклад `--audio-language uk --audio-language en` чи `--audio-language uk,en`. |
@@ -51,7 +52,7 @@
 ```text
 <timestamp> | INFO | Movie.mkv | extract | tracks=2 attachments=4
 <timestamp> | INFO | Movie_track2.eac3 | upload | kind=track type=audio visibility=public id=123
-<timestamp> | INFO | run | summary | tracks_extracted=2 attachments_extracted=4 tracks_uploaded=2 attachments_uploaded=4 already_published=0 standalone_uploaded=0 standalone_skipped=0 failed=0
+<timestamp> | INFO | run | summary | tracks_extracted=2 attachments_extracted=4 tracks_uploaded=2 attachments_uploaded=4 already_published=0 attachments_already_present=0 standalone_uploaded=0 standalone_skipped=0 failed=0
 ```
 
 ## Вкладені шрифти
@@ -60,7 +61,7 @@
 
 Доріжки й шрифти передаються до різних режимів одного виклику `mkvextract`, тому файл MKV не проходить повторний цикл витягання. Вкладені імена перетворюються на безпечні компоненти імені файлу перед записом до `--output-dir`; ім'я з контейнера не може вибрати каталог призначення.
 
-Кожен шрифт завантажується на URL, утворений додаванням `/attachments` до `--api-url`. Наприклад, `https://audio-bucket.site/api/uploader` перетворюється на `https://audio-bucket.site/api/uploader/attachments`. Multipart-запит містить `original_video_mediainfo`, `original_video_mediainfo_text`, `media_file`, збережене в контейнері ім'я як `original_filename` та беззнаковий 64-бітний `uid` вкладення. Завантажені файли шрифтів видаляються, якщо не вказано `--keep-extracted`.
+Кожен шрифт завантажується на URL, утворений додаванням `/attachments` до `--api-url`. Наприклад, `https://audio-bucket.site/api/uploader` перетворюється на `https://audio-bucket.site/api/uploader/attachments`. Multipart-запит містить `original_video_mediainfo`, `original_video_mediainfo_text`, `media_file`, складене значення `{video_name}_attachment{attachment_id}_{container_filename}` як `original_filename` та беззнаковий 64-бітний `uid` вкладення. Ім'я multipart-файлу та `original_filename` завжди мають однакове складене значення. Завантажені файли шрифтів видаляються, якщо не вказано `--keep-extracted`.
 
 ## Самостійні файли
 
@@ -79,6 +80,8 @@
 Самостійні файли-джерела ніколи не видаляються (`--keep-extracted` на них не поширюється).
 
 ## Перевірка дублікатів
+
+Перед запуском `mkvextract` завантажувач надсилає `unique_id` оригінального відео з MediaInfo до `POST /api/uploader/original-video-check` із заголовком `X-API-Key`. Якщо відео вже існує, витягаються лише ті доріжки, чиїх ID MediaInfo немає в `track_ids_inside_container`, і ті шрифти, чиїх складених імен немає в `attachment_original_filenames`. Значення `ID` MediaInfo зіставляється з відповідним ID доріжки для `mkvextract` (зазвичай це інше, нуль-базоване число); у поле `track_id_inside_container` і далі надсилається саме ID MediaInfo.
 
 Перед кожним завантаженням програма обчислює 64-символьний BLAKE3-256 дайджест витягнутого файлу та надсилає його до `POST /api/uploader/hash-check`. Якщо API повертає `{"exists": true}`, файл вважається вже опублікованим і завантаження пропускається.
 

@@ -1,147 +1,140 @@
 # Audio Bucket Uploader
 
-Extracts audio/subtitle tracks and embedded fonts from `.mkv` files and uploads them to Audio Bucket.
+Extracts selected audio and subtitle tracks plus embedded fonts from `.mkv` files, then uploads them to Audio Bucket.
 
 ## Overview
 
-- finds one `.mkv` file or recursively scans a directory for `.mkv` files
-- checks `POST /api/uploader/original-video-check` with the video's MediaInfo `unique_id` before extraction and skips tracks/attachments already stored by the server
-- extracts matching audio/subtitle tracks and embedded font attachments with one `mkvextract` invocation
-- names extracted files as:
+- Process one `.mkv` file or recursively scan a directory.
+- Upload Ukrainian audio and all subtitle tracks by default; choose other languages when needed.
+- Extract tracks and font attachments in one `mkvextract` pass.
+- Avoid work already stored on the server and duplicate uploads.
+- Show extraction and upload progress, outcomes, skips, errors, and a final summary.
+- Optionally upload loose audio and subtitle files beside their source video.
 
-```text
-{original_movie_name}_track{track_id_inside_container}.{detected_extension}
-```
+## Install and use
 
-Font attachments are named as:
+The easiest option is the Docker-based helper script. Install and start [Docker](https://www.docker.com/get-started/) first.
 
-```text
-{original_movie_name}_attachment{attachment_id}_{safe_container_filename}
-```
+### macOS and Linux
 
-- uploads each extracted track to Audio Bucket as a draft or public track through `POST /api/uploader`
-- uploads each font attachment through `POST /api/uploader/attachments`, preserving its Matroska attachment UID
-- computes a BLAKE3-256 hash and checks `POST /api/uploader/hash-check` before uploading to prevent duplicates
-- sends the extracted `media_file`, original MKV MediaInfo JSON/text, MediaInfo `ID` as `track_id_inside_container`, and the selected `visibility` in the upload request
-- shows extraction/upload progress, successful results, skips, errors, and a final summary in one compact structured style
-- with `--verbose`, additionally prints file lists, extracted-media tables, HTTP status, `mkvextract` details, and cleanup paths
-- removes each extracted file after a successful upload unless `--keep-extracted` is set
-- optionally also uploads standalone (loose) audio and subtitle files found next to their source video (see [Standalone files](#standalone-files))
-
-## Arguments
-
-| Argument | Required | Default | Description |
-| --- | --- | --- | --- |
-| `--api-key` | Yes | none | Audio Bucket user API key. It is sent as a bearer token for uploads and in `X-API-Key` for the original-video check. |
-| `--api-url` | Yes | none | Audio Bucket uploader endpoint URL, for example `https://audio-bucket.site/api/uploader`. |
-| `--input` | No | `/input` | Path to a single `.mkv` file or a directory containing `.mkv` files. Directories are scanned recursively. |
-| `--audio-language` | No | `uk` | Target audio track language. Pass it multiple times or use comma-separated values, for example `--audio-language uk --audio-language en` or `--audio-language uk,en`. |
-| `--subtitle-language` | No | `all` | Target subtitle track language. Pass it multiple times or use comma-separated values. `all` uploads every subtitle track regardless of language. |
-| `--output-dir` | No | OS-specific temp directory | Directory where extracted tracks and font attachments are written before upload. On macOS and Linux this is typically `/tmp`; on Windows it follows the standard temp location from the OS environment. |
-| `--keep-extracted` | No | `false` | Keep extracted files after successful upload. By default, uploaded extracted files are deleted. |
-| `--visibility` | No | `public` | Visibility for uploaded tracks: `draft` or `public`. |
-| `--standalone`, `--no-standalone` | No | `true` | Also discover and upload standalone (loose) audio/subtitle files. See [Standalone files](#standalone-files). Use `--no-standalone` to process `.mkv` files only. |
-| `--verbose`, `--no-verbose` | No | `false` | Additionally print file lists, extracted-media tables, HTTP status, `mkvextract` details, and cleanup paths. Requests never show their bodies. |
-
-Language filters are normalized, and common aliases are supported for languages such as `uk`, `ukr`, and `ukrainian`.
-
-## Log output
-
-Every log event uses `timestamp | level | target | action | details`. Default output contains the run-level counts, extraction/upload progress, outcomes, skips, errors, and final summary. Details use compact `key=value` fields where practical. `--verbose` adds diagnostics without changing the format.
-
-```text
-<timestamp> | INFO | Movie.mkv | extract | tracks=2 attachments=4
-<timestamp> | INFO | Movie_track2.eac3 | upload | kind=track type=audio visibility=public id=123
-<timestamp> | INFO | run | summary | tracks_extracted=2 attachments_extracted=4 tracks_uploaded=2 attachments_uploaded=4 already_published=0 attachments_already_present=0 standalone_uploaded=0 standalone_skipped=0 failed=0
-```
-
-## Font attachments
-
-Font attachments are discovered from the structured `attachments` array produced by `mkvmerge -J`. The uploader recognizes the official Matroska font MIME types, their common legacy forms, and font extensions on generic `application/octet-stream` attachments. Covers and other non-font attachments are ignored.
-
-Tracks and fonts are passed to separate extraction modes in one `mkvextract` command, avoiding a second extraction pass over the MKV. Embedded filenames are reduced to safe filename components before writing to `--output-dir`; an attachment cannot select a directory through its container filename.
-
-Each font is uploaded to the URL formed by appending `/attachments` to `--api-url`. For example, `https://audio-bucket.site/api/uploader` becomes `https://audio-bucket.site/api/uploader/attachments`. The multipart request contains `original_video_mediainfo`, `original_video_mediainfo_text`, `media_file`, the composite `{video_name}_attachment{attachment_id}_{container_filename}` value as `original_filename`, and the attachment's unsigned 64-bit `uid`. The multipart file name and `original_filename` always use the same composite value. Uploaded font files are removed unless `--keep-extracted` is set.
-
-## Standalone files
-
-With `--standalone` (the default) the uploader also picks up loose audio and subtitle files, not just tracks inside `.mkv` containers:
-
-- **Audio:** `wav`, `mp3`, `aac`, `flac`, `ogg`, `m4a`, `opus`, `ac3`, `eac3`, `ac4`, `dts`, `dtshd`, `truehd`, `mlp`, `thd`
-- **Subtitles:** `ass`, `srt`, `pgs`, `sup`
-
-The uploader endpoint identifies a track by the source video's MediaInfo `unique_id` and reads the track's type and language from that video's MediaInfo. A standalone file is therefore uploaded only when both of the following hold, and is otherwise skipped with a printed reason:
-
-1. Its language can be determined from the file name (e.g. `Movie.uk.srt`, `Show.en-GB.forced.srt`, `Movie_track2_[ukr]_DELAY 0ms.eac3`) or from MediaInfo.
-2. A **sibling video** with the same base name sits in the same directory (e.g. `Movie.mkv` next to `Movie.uk.srt`, or `Movie.mkv` next to `Movie_track2.eac3`). The video must expose a MediaInfo `unique_id` — `.mkv` does; most `.mp4` files do not.
-
-The source video does **not** need to already contain a matching track. An external subtitle usually has no counterpart inside the container (`Movie.mkv` carries Ukrainian audio but no Ukrainian subtitle track), so the standalone file's own MediaInfo is appended to the source video's MediaInfo as an extra track and `track_id_inside_container` points at it. The General `unique_id` stays that of the real source video, so the upload lands on the correct release and the endpoint reads the correct type and language.
-
-Standalone source files are never deleted (`--keep-extracted` does not apply to them).
-
-## Duplicate Check
-
-Before invoking `mkvextract`, the uploader sends the original video's MediaInfo `unique_id` to `POST /api/uploader/original-video-check` using the `X-API-Key` header. When the video exists, only MediaInfo track IDs absent from `track_ids_inside_container` and composite font filenames absent from `attachment_original_filenames` are extracted. MediaInfo `ID` values are mapped to their corresponding `mkvextract` track IDs (normally a different, zero-based number); the MediaInfo ID remains the value sent as `track_id_inside_container`.
-
-Before each upload, the uploader computes the extracted file’s 64-character BLAKE3-256 digest and sends it to `POST /api/uploader/hash-check`. If the API returns `{"exists": true}`, the file is treated as already published and the upload is skipped.
-
-The duplicate check is based only on the file hash and is not affected by `--visibility`: it runs the same way for both `public` and `draft`. The `--visibility` value is used only for an actual upload after the API returns `{"exists": false}`. Therefore, rerunning with a different visibility also skips the file if the API already finds that hash.
-
-The check applies to standalone track files as well. Font attachments are uploaded by UID through the attachments endpoint and do not use the track hash-check endpoint.
-
-## Easiest Way to Run (macOS and Linux)
-
-Install and start [Docker](https://www.docker.com/get-started/) first. Then download the helper script and make it executable:
+Download the helper and make it executable:
 
 ```bash
 curl -fsSLO https://raw.githubusercontent.com/sirko-ua/audio-bucket-uploader/main/scripts/ukrab-uploader.sh
 chmod +x ukrab-uploader.sh
 ```
 
-Or, with `wget`:
+Or use `wget`:
 
 ```bash
 wget https://raw.githubusercontent.com/sirko-ua/audio-bucket-uploader/main/scripts/ukrab-uploader.sh
 chmod +x ukrab-uploader.sh
 ```
 
-Run it with your API key and either one `.mkv` file or a directory of `.mkv` files. Directories are scanned recursively:
+Upload one `.mkv` file or a directory (directories are scanned recursively):
 
 ```bash
 ./ukrab-uploader.sh <your_api_key> /path/to/movie-or-directory
 ```
 
-Uploads are public by default. To create drafts instead, add `draft`:
+Uploads are public by default. Add `draft` to create drafts:
 
 ```bash
 ./ukrab-uploader.sh <your_api_key> /path/to/movie-or-directory draft
 ```
 
-The named form also works: `./ukrab-uploader.sh --api-key <your_api_key> --input /path/to/movie-or-directory --visibility draft`. Add `--verbose` to either form for detailed output (or `--no-verbose` to explicitly select concise output). The helper pulls `ghcr.io/sirko-ua/audio-bucket-uploader:latest` automatically when needed and uses `https://ukrab.work/api/uploader`. It keeps the standard uploader defaults: Ukrainian audio, all subtitles, temporary extracted files, and concise output.
+The named form also works: `./ukrab-uploader.sh --api-key <your_api_key> --input /path/to/movie-or-directory --visibility draft`. Add `--verbose` for detailed output. The helper pulls `ghcr.io/sirko-ua/audio-bucket-uploader:latest` as needed, uses `https://ukrab.work/api/uploader`, and keeps the standard defaults.
 
-## Easiest Way to Run (Windows)
+### Windows
 
-Install and start [Docker Desktop](https://www.docker.com/products/docker-desktop/) first. In PowerShell, download the Windows helper script:
+Install and start [Docker Desktop](https://www.docker.com/products/docker-desktop/). In PowerShell, download the helper:
 
 ```powershell
 Invoke-WebRequest https://raw.githubusercontent.com/sirko-ua/audio-bucket-uploader/main/scripts/ukrab-uploader.bat -OutFile ukrab-uploader.bat
 ```
 
-Run it with your API key and the path to one `.mkv` file or a directory of `.mkv` files:
+Run it with your API key and a file or directory:
 
 ```powershell
 .\ukrab-uploader.bat <your_api_key> "C:\path\to\movie-or-directory"
 ```
 
-Uploads are public by default. Add `draft` as the final argument to create drafts instead:
+Add `draft` as the final argument to create drafts:
 
 ```powershell
 .\ukrab-uploader.bat <your_api_key> "C:\path\to\movie-or-directory" draft
 ```
 
-The named form also works: `.\ukrab-uploader.bat --api-key <your_api_key> --input "C:\path\to\movie-or-directory" --visibility draft`. Add `--verbose` to either form for detailed output (or `--no-verbose` to explicitly select concise output).
+The named form also works: `.\ukrab-uploader.bat --api-key <your_api_key> --input "C:\path\to\movie-or-directory" --visibility draft`. Add `--verbose` for detailed output.
 
-## Run With Docker Directly
+## Arguments
+
+| Argument | Required | Default | Description |
+| --- | --- | --- | --- |
+| `--api-key` | Yes | none | Audio Bucket user API key. Sent as a bearer token for uploads and in `X-API-Key` for the original-video check. |
+| `--api-url` | Yes | none | Audio Bucket uploader endpoint URL, for example `https://audio-bucket.site/api/uploader`. |
+| `--input` | No | `/input` | A single `.mkv` file or a directory of `.mkv` files. Directories are scanned recursively. |
+| `--audio-language` | No | `uk` | Audio languages to upload. Repeat it or use comma-separated values, for example `--audio-language uk,en`. |
+| `--subtitle-language` | No | `all` | Subtitle languages to upload. Repeat it or use comma-separated values; `all` uploads every subtitle track. |
+| `--output-dir` | No | OS temp directory | Where extracted tracks and fonts are written before upload. |
+| `--keep-extracted` | No | `false` | Keep extracted files after successful upload. |
+| `--visibility` | No | `public` | Track visibility: `draft` or `public`. |
+| `--standalone`, `--no-standalone` | No | `true` | Also discover loose audio/subtitle files. See [Standalone files](#standalone-files). |
+| `--verbose`, `--no-verbose` | No | `false` | Show file lists, extracted-media tables, HTTP status, `mkvextract` details, and cleanup paths. Request bodies are never shown. |
+
+Language filters are normalized, with aliases such as `uk`, `ukr`, and `ukrainian` supported.
+
+## How it works under the hood
+
+### Overview
+
+The uploader reads the source video’s MediaInfo, selects matching tracks, and invokes `mkvextract` once for tracks and font attachments. Extracted tracks are named:
+
+```text
+{original_movie_name}_track{track_id_inside_container}.{detected_extension}
+```
+
+Font attachments are named:
+
+```text
+{original_movie_name}_attachment{attachment_id}_{safe_container_filename}
+```
+
+Each track upload includes the extracted `media_file`, original MKV MediaInfo in JSON and text, the MediaInfo `ID` as `track_id_inside_container`, and the selected `visibility`. Successfully uploaded extracted files are removed unless `--keep-extracted` is set.
+
+Every log event follows `timestamp | level | target | action | details`. Default output includes extraction/upload progress, outcomes, skips, errors, and a summary; `--verbose` adds diagnostics without changing that format.
+
+```text
+<timestamp> | INFO | Movie.mkv | extract | tracks=2 attachments=4
+<timestamp> | INFO | Movie.mkv | extract |  50%
+<timestamp> | INFO | Movie_track2.eac3 | upload | kind=track type=audio visibility=public id=123
+<timestamp> | INFO | run | summary | tracks_extracted=2 attachments_extracted=4 tracks_uploaded=2 attachments_uploaded=4 already_published=0 attachments_already_present=0 standalone_uploaded=0 standalone_skipped=0 failed=0
+```
+
+### Duplicate check
+
+Before `mkvextract` runs, the uploader sends the original video’s MediaInfo `unique_id` to `POST /api/uploader/original-video-check` using `X-API-Key`. If the video exists, it extracts only MediaInfo track IDs absent from `track_ids_inside_container` and fonts whose composite names are absent from `attachment_original_filenames`. MediaInfo IDs are mapped to the usually different, zero-based `mkvextract` track IDs; the MediaInfo ID remains the value sent as `track_id_inside_container`.
+
+Before each track upload, it computes a 64-character BLAKE3-256 digest and calls `POST /api/uploader/hash-check`. `{"exists": true}` skips the upload. This check applies equally to `public` and `draft`, and applies to standalone tracks too.
+
+### Font attachments
+
+Fonts come from `mkvmerge -J`’s structured `attachments` array. The uploader recognizes official Matroska font MIME types, common legacy forms, and font extensions on generic `application/octet-stream` attachments; covers and other attachments are ignored. Container filenames are reduced to safe filename components before writing to `--output-dir`.
+
+Fonts are uploaded to `--api-url` with `/attachments` appended—for example, `https://audio-bucket.site/api/uploader/attachments`. The multipart request includes the source MediaInfo, the extracted file, the composite filename as `original_filename`, and the attachment’s unsigned 64-bit Matroska UID. Font uploads use this UID-based endpoint rather than the track hash-check endpoint.
+
+### Standalone files
+
+With `--standalone` (the default), the uploader also looks for loose files beside their source video:
+
+- **Audio:** `wav`, `mp3`, `aac`, `flac`, `ogg`, `m4a`, `opus`, `ac3`, `eac3`, `ac4`, `dts`, `dtshd`, `truehd`, `mlp`, `thd`
+- **Subtitles:** `ass`, `srt`, `pgs`, `sup`
+
+A standalone file is uploaded only when its language can be determined from its filename (for example, `Movie.uk.srt` or `Movie_track2_[ukr]_DELAY 0ms.eac3`) or MediaInfo, and a sibling video with the same base name has a MediaInfo `unique_id`. The source video does not need to contain a matching track: the standalone file’s MediaInfo is appended as an extra track while retaining the real source video’s `unique_id`. Standalone source files are never deleted.
+
+## Run with Docker or locally
+
+### Docker
 
 Pull the published image:
 
@@ -149,7 +142,7 @@ Pull the published image:
 docker pull ghcr.io/sirko-ua/audio-bucket-uploader:latest
 ```
 
-Minimum required parameters:
+Minimum invocation:
 
 ```bash
 docker run --rm \
@@ -159,9 +152,7 @@ docker run --rm \
   --api-url https://audio-bucket.site/api/uploader
 ```
 
-This uses the default `--input /input`, so the uploader scans the mounted movie directory.
-
-Full version with all available parameters:
+This uses the default `--input /input`. To keep extracted output, mount a writable directory and set `--output-dir`:
 
 ```bash
 docker run --rm \
@@ -170,42 +161,19 @@ docker run --rm \
   ghcr.io/sirko-ua/audio-bucket-uploader:latest \
   --api-key <your_api_key> \
   --api-url https://audio-bucket.site/api/uploader \
-  --input /input \
-  --audio-language uk \
-  --subtitle-language all \
   --output-dir /output \
   --keep-extracted \
-  --visibility public \
   --verbose
 ```
 
-## Run Locally
+### Locally
 
-Install Python dependencies first:
+Install Python dependencies plus `mediainfo` and MKVToolNix (which provides `mkvmerge` and `mkvextract`), then run:
 
 ```bash
 python -m pip install -r requirements.txt
-```
-
-Minimum required parameters:
-
-```bash
-python -m uploader \
-  --api-key <your_api_key> \
-  --api-url https://audio-bucket.site/api/uploader
-```
-
-Full version:
-
-```bash
 python -m uploader \
   --api-key <your_api_key> \
   --api-url https://audio-bucket.site/api/uploader \
-  --input /media/movies \
-  --audio-language uk,en \
-  --subtitle-language all \
-  --output-dir ./extracted \
-  --keep-extracted \
-  --visibility public \
-  --verbose
+  --input /media/movies
 ```

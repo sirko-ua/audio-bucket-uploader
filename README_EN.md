@@ -125,12 +125,12 @@ Fonts are uploaded to `--api-url` with `/attachments` appended—for example, `h
 
 ### Standalone files
 
-With `--standalone` (the default), the uploader also looks for loose files beside their source video:
+With `--standalone` (the default), the uploader also looks for loose files:
 
 - **Audio:** `wav`, `mp3`, `aac`, `flac`, `ogg`, `m4a`, `opus`, `ac3`, `eac3`, `ac4`, `dts`, `dtshd`, `truehd`, `mlp`, `thd`
 - **Subtitles:** `ass`, `srt`, `pgs`, `sup`
 
-A standalone file is uploaded only when its language can be determined from its filename (for example, `Movie.uk.srt` or `Movie_track2_[ukr]_DELAY 0ms.eac3`) or MediaInfo, and a sibling video with the same base name has a MediaInfo `unique_id`. The source video does not need to contain a matching track: the standalone file’s MediaInfo is appended as an extra track while retaining the real source video’s `unique_id`. Standalone source files are never deleted.
+A standalone file is uploaded when its language can be determined from its filename (for example, `Movie.uk.srt` or `Movie_track2_[ukr]_DELAY 0ms.eac3`) or MediaInfo. A sibling video with the same base name is optional: when it has a MediaInfo `unique_id`, its metadata identifies the upload and the standalone track is appended as an extra track when needed. Without a usable sibling video, the uploader sends the standalone file’s own MediaInfo instead. Standalone source files are never deleted.
 
 ## Run with Docker or locally
 

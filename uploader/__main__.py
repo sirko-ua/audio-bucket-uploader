@@ -344,10 +344,10 @@ def parse_args() -> argparse.Namespace:
             f"{', '.join(sorted(STANDALONE_AUDIO_EXTENSIONS))}; subtitles: "
             f"{', '.join(sorted(STANDALONE_SUBTITLE_EXTENSIONS))}). "
             "Language is taken from the file name (e.g. movie.uk.srt) or MediaInfo, and "
-            "the file is attached to a sibling video (same base name) that supplies the "
-            "required source MediaInfo; files without a determinable language or sibling "
-            "video are skipped. Standalone source files are never deleted. Defaults to "
-            "true; use --no-standalone to disable."
+            "a matching sibling video is used when available; otherwise the standalone "
+            "file's own MediaInfo is sent. Files without a determinable language are "
+            "skipped. Standalone source files are never deleted. Defaults to true; use "
+            "--no-standalone to disable."
         ),
     )
     parser.add_argument(
@@ -1093,6 +1093,23 @@ def add_synthetic_media_info_track(
     return new_id
 
 
+def standalone_media_info_track_id(
+    media_info_payload: dict,
+    own_media_info_track: dict | None,
+    track_type: str,
+    language: str,
+) -> int:
+    """Return the standalone track's MediaInfo ID, creating one if needed."""
+    media_info_id = parse_media_info_track_id(
+        get_media_info_value(own_media_info_track, "id", "ID")
+    )
+    if media_info_id is not None:
+        return media_info_id
+    return add_synthetic_media_info_track(
+        media_info_payload, own_media_info_track, track_type, language
+    )
+
+
 def build_standalone_track(
     file_path: Path,
     target_languages_by_type: dict[str, list[str]],
@@ -1101,7 +1118,7 @@ def build_standalone_track(
     if track_type is None:
         raise StandaloneSkip(f"unsupported extension {file_path.suffix}")
 
-    _, _, own_tracks_by_type = collect_standalone_media_info(file_path)
+    own_payload, own_text, own_tracks_by_type = collect_standalone_media_info(file_path)
     media_info_type = "audio" if track_type == "audio" else "text"
     own_media_info_track = (
         own_tracks_by_type[media_info_type][0] if own_tracks_by_type[media_info_type] else None
@@ -1128,35 +1145,38 @@ def build_standalone_track(
         raise StandaloneSkip(f"language {detected_language!r} not in requested {requested}")
 
     source_video = find_source_video(file_path)
-    if source_video is None:
-        raise StandaloneSkip(
-            "no sibling video found to supply the source MediaInfo unique_id "
-            "required by the uploader endpoint"
-        )
-
-    media_info_by_type, video_payload, video_text, mkvmerge_payload = collect_media_info(source_video)
-    if not media_info_has_unique_id(video_payload):
-        raise StandaloneSkip(
-            f"source video {source_video.name} has no MediaInfo unique_id "
-            "(e.g. an MP4 container); cannot attach a standalone track to it"
-        )
     language = normalize_language(detected_language) or "und"
 
-    media_info_track_id = choose_container_track_id(
-        mkvmerge_payload, media_info_by_type, track_type, detected_language
-    )
-    if media_info_track_id is None:
-        # An external track (e.g. a loose .srt for a video with no embedded
-        # subtitle track) has no container track to point at, and the endpoint
-        # can only read a track's type and language from the MediaInfo we send,
-        # keyed by track_id_inside_container. So describe the loose file as a
-        # track of the source video, using its own MediaInfo. The General
-        # unique_id stays that of the real source video, so the upload still
-        # lands on the correct release.
-        # ponytail: the payload then describes a track the container does not
-        # physically contain. Drop this once the endpoint accepts an explicit
-        # track type + language for standalone files.
-        media_info_track_id = add_synthetic_media_info_track(
+    if source_video is not None:
+        media_info_by_type, video_payload, video_text, mkvmerge_payload = collect_media_info(
+            source_video
+        )
+        if media_info_has_unique_id(video_payload):
+            media_info_track_id = choose_container_track_id(
+                mkvmerge_payload, media_info_by_type, track_type, detected_language
+            )
+            if media_info_track_id is None:
+                # An external track (e.g. a loose .srt for a video with no
+                # embedded subtitle track) is represented in the source
+                # video's MediaInfo so the endpoint can read its type and
+                # language by track_id_inside_container.
+                media_info_track_id = add_synthetic_media_info_track(
+                    video_payload, own_media_info_track, track_type, language
+                )
+        else:
+            # A sibling container without a usable unique_id cannot identify
+            # the upload. Treat the loose file as its own source instead.
+            video_payload = own_payload
+            video_text = own_text
+            media_info_track_id = standalone_media_info_track_id(
+                video_payload, own_media_info_track, track_type, language
+            )
+    else:
+        # A standalone upload does not require its original movie to be
+        # present locally. Its own MediaInfo describes the uploaded track.
+        video_payload = own_payload
+        video_text = own_text
+        media_info_track_id = standalone_media_info_track_id(
             video_payload, own_media_info_track, track_type, language
         )
 

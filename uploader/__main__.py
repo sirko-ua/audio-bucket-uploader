@@ -1366,7 +1366,13 @@ def filter_missing_media(
     return missing_tracks, missing_attachments
 
 
-def is_track_already_published(api_url: str, api_key: str, file_path: Path, *, verbose: bool) -> bool:
+def find_track_by_hash(
+    api_url: str,
+    api_key: str,
+    file_path: Path,
+    *,
+    verbose: bool,
+) -> dict:
     file_hash = get_file_hash(file_path)
     check_url = hash_check_url(api_url)
     request_payload = {
@@ -1410,7 +1416,7 @@ def is_track_already_published(api_url: str, api_key: str, file_path: Path, *, v
         raise UploaderError(
             f"hash-check failed file={file_path.name} error=missing-exists"
         )
-    return payload["exists"]
+    return payload
 
 
 def upload_prepared_track(
@@ -1700,6 +1706,7 @@ def main() -> int:
     extracted_count = 0
     extracted_attachment_count = 0
     uploaded_count = 0
+    reused_track_count = 0
     uploaded_attachment_count = 0
     skipped_count = 0
     existing_attachment_count = 0
@@ -1820,27 +1827,21 @@ def main() -> int:
                 action="extract",
             )
             for prepared_track in prepared_tracks:
-                if is_track_already_published(
+                hash_match = find_track_by_hash(
                     args.api_url,
                     args.api_key,
                     prepared_track.output_path,
                     verbose=args.verbose,
-                ):
-                    skipped_count += 1
+                )
+                if hash_match["exists"]:
                     log_event(
-                        "WARNING",
+                        "INFO",
                         prepared_track.output_path.name,
-                        "skip",
-                        "reason=already-published",
+                        "hash-check",
+                        f"candidate_track_id={hash_match.get('track_id')} "
+                        "action=submit-for-scoped-check",
+                        verbose=args.verbose,
                     )
-                    if not args.keep_extracted and prepared_track.cleanup_after_upload:
-                        remove_extracted_file(prepared_track)
-                        log_event(
-                            "INFO", prepared_track.output_path.name, "cleanup",
-                            f"path={prepared_track.output_path}",
-                            verbose=args.verbose,
-                        )
-                    continue
                 upload_response = upload_prepared_track(
                     args.api_url,
                     args.api_key,
@@ -1848,15 +1849,20 @@ def main() -> int:
                     args.visibility,
                     verbose=args.verbose,
                 )
-                uploaded_count += 1
+                reused_existing = upload_response.get("reused_existing") is True
+                if reused_existing:
+                    reused_track_count += 1
+                else:
+                    uploaded_count += 1
                 response_id = upload_response.get("id")
                 id_detail = f" id={response_id}" if response_id is not None else ""
+                reuse_detail = " reused_existing=true" if reused_existing else ""
                 log_event(
                     "INFO",
                     prepared_track.output_path.name,
                     "upload",
                     f"kind=track type={prepared_track.track_type} "
-                    f"visibility={args.visibility}{id_detail}",
+                    f"visibility={args.visibility}{id_detail}{reuse_detail}",
                 )
                 if not args.keep_extracted and prepared_track.cleanup_after_upload:
                     remove_extracted_file(prepared_track)
@@ -1907,21 +1913,21 @@ def main() -> int:
                 verbose=args.verbose,
             )
             prepared_track = build_standalone_track(file_path, target_languages_by_type)
-            if is_track_already_published(
+            hash_match = find_track_by_hash(
                 args.api_url,
                 args.api_key,
                 prepared_track.output_path,
                 verbose=args.verbose,
-            ):
-                skipped_count += 1
-                standalone_skipped_count += 1
+            )
+            if hash_match["exists"]:
                 log_event(
-                    "WARNING",
+                    "INFO",
                     file_path.name,
-                    "skip",
-                    "reason=already-published",
+                    "hash-check",
+                    f"candidate_track_id={hash_match.get('track_id')} "
+                    "action=submit-for-scoped-check",
+                    verbose=args.verbose,
                 )
-                continue
             log_event(
                 "INFO", file_path.name, "upload",
                 f"kind=standalone type={prepared_track.track_type} "
@@ -1935,16 +1941,21 @@ def main() -> int:
                 args.visibility,
                 verbose=args.verbose,
             )
-            uploaded_count += 1
-            standalone_uploaded_count += 1
+            reused_existing = upload_response.get("reused_existing") is True
+            if reused_existing:
+                reused_track_count += 1
+            else:
+                uploaded_count += 1
+                standalone_uploaded_count += 1
             response_id = upload_response.get("id")
             id_detail = f" id={response_id}" if response_id is not None else ""
+            reuse_detail = " reused_existing=true" if reused_existing else ""
             log_event(
                 "INFO",
                 file_path.name,
                 "upload",
                 f"kind=standalone type={prepared_track.track_type} "
-                f"visibility={args.visibility}{id_detail}",
+                f"visibility={args.visibility}{id_detail}{reuse_detail}",
             )
         except StandaloneSkip as skip:
             standalone_skipped_count += 1
@@ -1962,8 +1973,9 @@ def main() -> int:
         f"tracks_extracted={extracted_count} "
         f"attachments_extracted={extracted_attachment_count} "
         f"tracks_uploaded={uploaded_count} "
+        f"tracks_reused={reused_track_count} "
         f"attachments_uploaded={uploaded_attachment_count} "
-        f"already_published={skipped_count} "
+        f"tracks_already_present={skipped_count} "
         f"attachments_already_present={existing_attachment_count} "
         f"standalone_uploaded={standalone_uploaded_count} "
         f"standalone_skipped={standalone_skipped_count} "

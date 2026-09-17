@@ -184,6 +184,7 @@ class OriginalVideoCheck:
     exists: bool
     track_ids_inside_container: frozenset[int]
     attachment_original_filenames: frozenset[str]
+    attachment_uids: frozenset[str]
 
 
 class ProgressFile:
@@ -1322,6 +1323,7 @@ def check_original_video(
 
     track_ids = payload.get("track_ids_inside_container")
     attachment_names = payload.get("attachment_original_filenames")
+    attachment_uids = payload.get("attachment_uids", [])
     if not isinstance(track_ids, list) or any(
         isinstance(track_id, bool) or not isinstance(track_id, int)
         for track_id in track_ids
@@ -1335,11 +1337,18 @@ def check_original_video(
         raise UploaderError(
             "original-video-check failed error=invalid-attachment-original-filenames"
         )
+    if not isinstance(attachment_uids, list) or any(
+        not isinstance(uid, str) for uid in attachment_uids
+    ):
+        raise UploaderError(
+            "original-video-check failed error=invalid-attachment-uids"
+        )
 
     return OriginalVideoCheck(
         exists=payload["exists"],
         track_ids_inside_container=frozenset(track_ids),
         attachment_original_filenames=frozenset(attachment_names),
+        attachment_uids=frozenset(attachment_uids),
     )
 
 
@@ -1360,7 +1369,8 @@ def filter_missing_media(
     missing_attachments = [
         attachment
         for attachment in prepared_attachments
-        if attachment.original_file_name
+        if str(attachment.uid) not in original_video.attachment_uids
+        and attachment.original_file_name
         not in original_video.attachment_original_filenames
     ]
     return missing_tracks, missing_attachments

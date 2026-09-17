@@ -113,9 +113,9 @@ Invoke-WebRequest https://raw.githubusercontent.com/sirko-ua/audio-bucket-upload
 
 ### Перевірка дублікатів
 
-Перед запуском `mkvextract` завантажувач надсилає `unique_id` оригінального відео з MediaInfo до `POST /api/uploader/original-video-check` із `X-API-Key`. Якщо відео вже існує, витягуються лише ID MediaInfo, відсутні в `track_ids_inside_container`, і шрифти, чиї складені імена відсутні в `attachment_original_filenames`. ID MediaInfo зіставляються з зазвичай іншими, нуль-базованими ID `mkvextract`; до `track_id_inside_container` надсилається саме ID MediaInfo.
+Перед запуском `mkvextract` завантажувач надсилає `unique_id` оригінального відео з MediaInfo та вибрану `visibility` до `POST /api/uploader/original-video-check` із `X-API-Key`. Для публічного завантаження вже наявними вважаються лише публічні доріжки. Для чернетки враховуються лише чернетки поточного користувача API. Витягуються лише ID MediaInfo, відсутні в `track_ids_inside_container`, і шрифти, чиї складені імена відсутні в `attachment_original_filenames`. ID MediaInfo зіставляються з зазвичай іншими, нуль-базованими ID `mkvextract`; до `track_id_inside_container` надсилається саме ID MediaInfo.
 
-Перед кожним завантаженням доріжки обчислюється 64-символьний BLAKE3-256 дайджест і виконується `POST /api/uploader/hash-check`. Відповідь `{"exists": true}` пропускає завантаження. Перевірка однакова для `public` і `draft` та застосовується до самостійних доріжок.
+Перед кожним завантаженням доріжки обчислюється 64-символьний BLAKE3-256 дайджест і разом із вибраною `visibility` надсилається до `POST /api/uploader/hash-check`. Збіг є лише діагностичним: доріжка все одно надсилається, щоб endpoint завантаження застосував правило дублікатів у межах назви, сезону та епізоду. Це також стосується самостійних доріжок.
 
 ### Вкладені шрифти
 

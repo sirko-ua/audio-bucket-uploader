@@ -1279,6 +1279,7 @@ def check_original_video(
     api_url: str,
     api_key: str,
     unique_id: str,
+    visibility: str,
     *,
     verbose: bool,
 ) -> OriginalVideoCheck:
@@ -1291,7 +1292,7 @@ def check_original_video(
         response = httpx.post(
             check_url,
             headers={"X-API-Key": api_key},
-            json={"unique_id": unique_id},
+            json={"unique_id": unique_id, "visibility": visibility},
             timeout=60.0,
         )
         response.raise_for_status()
@@ -1380,6 +1381,7 @@ def find_track_by_hash(
     api_url: str,
     api_key: str,
     file_path: Path,
+    visibility: str,
     *,
     verbose: bool,
 ) -> dict:
@@ -1388,6 +1390,7 @@ def find_track_by_hash(
     request_payload = {
         "file_hash": file_hash,
         "file_hash_algorithm": "blake3-256",
+        "visibility": visibility,
     }
     try:
         response = httpx.post(
@@ -1759,6 +1762,7 @@ def main() -> int:
                 args.api_url,
                 args.api_key,
                 unique_id,
+                args.visibility,
                 verbose=args.verbose,
             )
             candidate_track_count = len(prepared_tracks)
@@ -1841,6 +1845,7 @@ def main() -> int:
                     args.api_url,
                     args.api_key,
                     prepared_track.output_path,
+                    args.visibility,
                     verbose=args.verbose,
                 )
                 if hash_match["exists"]:
@@ -1927,6 +1932,7 @@ def main() -> int:
                 args.api_url,
                 args.api_key,
                 prepared_track.output_path,
+                args.visibility,
                 verbose=args.verbose,
             )
             if hash_match["exists"]:

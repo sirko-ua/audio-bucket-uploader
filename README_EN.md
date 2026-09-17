@@ -113,9 +113,9 @@ Every log event follows `timestamp | level | target | action | details`. Default
 
 ### Duplicate check
 
-Before `mkvextract` runs, the uploader sends the original video’s MediaInfo `unique_id` to `POST /api/uploader/original-video-check` using `X-API-Key`. If the video exists, it extracts only MediaInfo track IDs absent from `track_ids_inside_container` and fonts whose composite names are absent from `attachment_original_filenames`. MediaInfo IDs are mapped to the usually different, zero-based `mkvextract` track IDs; the MediaInfo ID remains the value sent as `track_id_inside_container`.
+Before `mkvextract` runs, the uploader sends the original video’s MediaInfo `unique_id` and selected `visibility` to `POST /api/uploader/original-video-check` using `X-API-Key`. For public uploads, only existing public tracks count as present. For draft uploads, only drafts owned by the current API user count. It extracts only MediaInfo track IDs absent from `track_ids_inside_container` and fonts whose composite names are absent from `attachment_original_filenames`. MediaInfo IDs are mapped to the usually different, zero-based `mkvextract` track IDs; the MediaInfo ID remains the value sent as `track_id_inside_container`.
 
-Before each track upload, it computes a 64-character BLAKE3-256 digest and calls `POST /api/uploader/hash-check`. `{"exists": true}` skips the upload. This check applies equally to `public` and `draft`, and applies to standalone tracks too.
+Before each track upload, it computes a 64-character BLAKE3-256 digest and sends it with the selected `visibility` to `POST /api/uploader/hash-check`. A matching result is diagnostic; the track is still submitted so the upload endpoint can apply its title/season/episode-scoped duplicate rule. This also applies to standalone tracks.
 
 ### Font attachments
 

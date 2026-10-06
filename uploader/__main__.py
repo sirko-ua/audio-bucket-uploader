@@ -8,7 +8,7 @@ import sys
 import tempfile
 from dataclasses import dataclass
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from urllib.parse import urlsplit, urlunsplit
 
 import blake3
@@ -385,19 +385,25 @@ def sanitize_media_info_paths(
     media_info_text: str,
     file_path: Path,
 ) -> tuple[dict, str]:
-    """Replace local paths in MediaInfo output with the source filename."""
+    """Keep each MediaInfo path's immediate parent folder and filename."""
     filename = file_path.name
+
+    def sanitized_media_info_path(value: str) -> str:
+        # Accept either path separator, including paths inside Docker mounts.
+        path = PureWindowsPath(value)
+        return "/".join(part for part in (path.parent.name, path.name) if part)
 
     def sanitize_json(value):
         if isinstance(value, dict):
             for key in list(value):
                 normalized_key = re.sub(r"[ _]", "", str(key)).lower()
                 if normalized_key == "foldername":
-                    # This has no value to the uploader and can expose the
-                    # user's directory after CompleteName is sanitized.
+                    # CompleteName retains the immediate parent folder;
+                    # omit the full directory hierarchy from this field.
                     value.pop(key)
                 elif normalized_key == "completename" or key == "@ref":
-                    value[key] = filename
+                    if isinstance(value[key], str):
+                        value[key] = sanitized_media_info_path(value[key])
                 else:
                     value[key] = sanitize_json(value[key])
         elif isinstance(value, list):
@@ -411,8 +417,8 @@ def sanitize_media_info_paths(
     # whole value as well as exact path occurrences, covering localized or
     # version-specific output without changing unrelated metadata.
     media_info_text = re.sub(
-        r"(?mi)^([ \t]*Complete name[ \t]*:[ \t]*).*$",
-        lambda match: f"{match.group(1)}{filename}",
+        r"(?mi)^([ \t]*Complete name[ \t]*:[ \t]*)(.*)$",
+        lambda match: f"{match.group(1)}{sanitized_media_info_path(match.group(2))}",
         media_info_text,
     )
     path_candidates = {str(file_path)}
@@ -422,7 +428,7 @@ def sanitize_media_info_paths(
         pass
     for path in sorted(path_candidates, key=len, reverse=True):
         if path and path != filename:
-            media_info_text = media_info_text.replace(path, filename)
+            media_info_text = media_info_text.replace(path, sanitized_media_info_path(path))
 
     return media_info_payload, media_info_text
 

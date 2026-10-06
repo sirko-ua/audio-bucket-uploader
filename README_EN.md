@@ -102,6 +102,8 @@ Font attachments are named:
 
 Each track upload includes the extracted `media_file`, original MKV MediaInfo in JSON and text, the MediaInfo `ID` as `track_id_inside_container`, and the selected `visibility`. Successfully uploaded extracted files are removed unless `--keep-extracted` is set.
 
+MediaInfo paths (`Complete name` and JSON `@ref`) retain only the immediate parent folder and filename, for example `Movie [1080p]/Movie.mkv`. This gives the server a folder name for title matching while removing higher directory levels. Paths inside Docker follow the configured mounts, including `/input`.
+
 Every log event follows `timestamp | level | target | action | details`. Default output includes extraction/upload progress, outcomes, skips, errors, and a summary; `--verbose` adds diagnostics without changing that format.
 
 ```text
